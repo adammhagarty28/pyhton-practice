@@ -1,12 +1,12 @@
 """
 This script simulates a 1D rod with 10 points being cooled by spray cooling using the actual discretized heat equaiton,
-calculating both the temperature evolution over time and its spatial derivatives (slope and curvature) using mf.diff(). 
+calculating both the temperature evolution over time and its spatial derivatives (slope and curvature) using np.diff(). 
 It tracks summary statistics across 30 time steps (mean temp, max temp, count of points still above a safe threshold),
 then produces multiple plots: temperature snapshots over time, mean temp and hot-point-count history, and a stacked
 plot showing temperature alongside its first and second derivatives at a chosen step. 
 
 Overall: heat_equation_rod.py
-1D spray cooling siutation using the discretized heat equation. 
+1D spray cooling simulation using the discretized heat equation. 
 Combines numpy (vectorized math, derivatives) and matplotlib(multiple plot types)
 
 """
@@ -50,6 +50,28 @@ for step in range(n_steps):
     temp_history[step]=temperatures
     mean_history[step]=temperatures.mean()
     hot_count_history[step]=np.sum(temperatures > room_temp +50)
+
+# Print terminal output every 5 steps
+    if step % 5 == 0:
+        print(f"Step {step:>3} | Max: {temperatures.max():.1f}C | Mean: {temperatures.mean():.1f}C | Min: {temperatures.min():.1f}C | Hot points: {int(hot_count_history[step])}")
+
+# After loop ends
+print("\n--- Final State ---")
+print(f"Max temp:  {temp_history[-1].max():.1f} C")
+print(f"Mean temp: {temp_history[-1].mean():.1f} C")
+print(f"Min temp:  {temp_history[-1].min():.1f} C")
+print(f"Hot points remaining: {int(hot_count_history[-1])}")
+
+# Print first and second derivative at chosen step
+chosen_step = 15
+fd = np.diff(temp_history[chosen_step]) / spacing
+sd = np.diff(fd) / spacing
+print(f"\n--- Derivatives at Step {chosen_step} ---")
+print(f"First derivative (dT/dx):  {np.round(fd, 2)}")
+print(f"Second derivative (d2T/dx2): {np.round(sd, 2)}")
+print(f"Most negative curvature at position: {positions[1:-1][np.argmin(sd)]:.2f}m")
+print(f"Most positive curvature at position: {positions[1:-1][np.argmax(sd)]:.2f}m")
+
 
 # --- Plot 1: temperature snapshots at different times ---
 plt.figure()

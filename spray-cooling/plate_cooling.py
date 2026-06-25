@@ -1,5 +1,5 @@
 """
-plate_cooling_2d.py
+plate_cooling.py
 2D steel plate spray cooling simulation.
 Physics: heat diffusion + Leidenfrost effect + uniform spray cooling
 Units: temperature in C, position in m, time in s
@@ -13,6 +13,27 @@ n = 10
 L = 0.1
 positions = np.linspace(0, L, n)
 dx = positions[1] - positions[0]
+
+# --- Real water properties at ~100C (Bergman Appendix A) ---
+mu_l = 2.82e-4        # dynamic viscosity of liquid water (N·s/m²)
+h_fg = 2257000.0      # latent heat of vaporization (J/kg)
+rho_l = 957.9         # liquid water density (kg/m³)
+rho_v = 0.596         # vapor density (kg/m³)
+sigma = 0.0589        # surface tension (N/m)
+Cp_l = 4217.0         # specific heat of liquid water (J/kg·K)
+Pr_l = 1.76           # Prandtl number of liquid water
+C_sf = 0.013          # surface fluid constant water/steel (Bergman Table 10.1)
+n_exp = 1.0           # exponent for water (Bergman Table 10.1)
+g = 9.81              # gravity (m/s²)
+T_sat = 100.0         # saturation temperature at 1 atm (°C)
+h_film = 300.0        # film boiling coefficient W/m²·K
+h_conv = 1000.0       # forced convection coefficient W/m²·K
+A_point = (L/n)**2    # area per grid point (m²)
+
+# --- Steel properties ---
+rho_solid = 7800.0    # density of steel (kg/m³)
+cp_solid = 500.0      # specific heat of steel (J/kg·K)
+V_point = A_point * (L/10)  # volume per grid point (m³)
 
 # --- Material properties (steel) ---
 alpha = 1.17e-5
@@ -58,20 +79,39 @@ while np.max(T) > safe_temp and step < 10000:
     laplacian = d2Tdx2 + d2Tdy2
     T = T + alpha * dt * laplacian
 
-    # --- Uniform spray cooling with Leidenfrost ---
-    T_avg = T.mean()
-    if T_avg > 200.0:
-        Q_uniform = 500.0 * (T - T_water) * dt / 10000.0
+  # --- Real spray cooling: local regime per point (Bergman Ch.10) ---
+    delta_Te = np.maximum(T - T_sat, 0.0)
+    q_total = np.zeros((n, n))
+
+    film_mask = T > 200.0
+    nucleate_mask = (T > T_sat) & (T <= 200.0)
+    conv_mask = T <= T_sat
+
+    # Film boiling: Newton's law with film boiling h
+    q_total[film_mask] = h_film * (T[film_mask] - T_sat)
+
+    # Nucleate boiling: Rohsenow correlation (Bergman Eq. 10.5)
+    term1 = mu_l * h_fg
+    term2 = (g * (rho_l - rho_v) / sigma) ** 0.5
+    term3 = (Cp_l * delta_Te[nucleate_mask] / (C_sf * h_fg * Pr_l**n_exp)) ** 3
+    q_total[nucleate_mask] = term1 * term2 * term3
+
+    # Single phase convection
+    q_total[conv_mask] = h_conv * (T[conv_mask] - T_water)
+
+    # Convert heat flux to temperature drop
+    Q_removed = q_total * A_point * dt
+    dT_cooling = Q_removed / (rho_solid * cp_solid * V_point)
+    T = T - dT_cooling
+    T = np.clip(T, T_water, None)
+
+    # Regime label for terminal output (dominant regime)
+    if np.any(film_mask):
         regime_label = "film boiling"
-    elif T_avg > 100.0:
-        Q_uniform = np.full((n, n), 5.0 * dt)
+    elif np.any(nucleate_mask):
         regime_label = "nucleate boiling"
     else:
-        Q_uniform = 0.5 * (T - T_water) * dt / 1000.0
         regime_label = "convection"
-
-    T = T - Q_uniform
-    T = np.clip(T, T_water, None)
 
     # --- Store history ---
     time_history.append(t)
@@ -100,9 +140,11 @@ print(f"Final max temp: {T.max():.1f} C | Final mean temp: {T.mean():.1f} C")
 # --- Plot 1: heatmap subplots ---
 fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 titles = [f"t = {snapshot_times[i]:.1f}s" for i in range(len(T_snapshots))]
+vmin_val=T_snapshots[0].min()
+vmax_val=T_snapshots[0].max()
 for idx, ax in enumerate(axes):
     if idx < len(T_snapshots):
-        im = ax.imshow(T_snapshots[idx], cmap="hot", vmin=T_water, vmax=900)
+        im=ax.imshow(T_snapshots[idx], cmap="hot", vmin=vmin_val,vmax=vmax_val)
         ax.set_title(titles[idx])
         ax.set_xlabel("x position")
         ax.set_ylabel("y position")
@@ -123,10 +165,9 @@ plt.grid(True)
 
 plt.show()
 
-"""
-To summarize: a 10x10 grid of points representing a steel plate that starts hot in the center (900 degrees celsius) and cooler
-at the edges (400 degrees celsius). Every time step, two tings happen simultaneously:heat diffuses between neighboring points
-according to the 2D heat equaiton (hot center spreading outward), and uniform spray cooling removes heat from every point on 
-the plate at a rate determined by the Leidenfrost condition (film boiling while the plate is above 200 degrees celsius average).
-The while loop keeps running until the hottest point drops below 300 degrees celsius, at whcih the plate is considered safely cooled
-"""
+
+"""To summarize: a 10x10 grid of points representing a steel plate that starts hot in the center (900 degrees celsius) and cooler
+at the edges (400 degrees celsius). Every time step, heat diffuses through the steeel plate and spray cooling removes heat
+from each grid point. The cooling regime is now determined locally at each grid point: film boiling betwen 100 and 200 degrees celsius,
+and cnvetion below 100 degrees celsius. The code converts local heat flux energy removed, then into a temperature drop using the
+steel density, heat capacity, and grid-cell volume. """
