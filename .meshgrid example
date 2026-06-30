@@ -1,0 +1,10 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+x=np.arange(-5,6)
+y=np.arange(-5,6)
+
+X,Y=np.meshgrid(x,y)
+print(f"{x} and {y}")
+print(f"\n X={X} and \nY={Y}")
+
