@@ -509,8 +509,7 @@ print(f"Random hot spot location: ({rand_cx:.2f}, {rand_cy:.2f})")
 
 #Step 12: Full-Sim loop + Comparison
 
-def run_simulation(T_init, k, use_bfs_pattern=True, 
-                   max_steps=2000, seed=0):
+def run_simulation(T_init, k, use_bfs_pattern=True, max_steps=2000, seed=0):
     """
     Full spray cooling simulation with proportional policy.
     Returns history of temperatures and spray for analysis.
