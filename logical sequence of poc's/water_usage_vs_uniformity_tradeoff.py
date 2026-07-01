@@ -7,7 +7,7 @@ T_ambient = 25.0
 T_initial = 900.0
  
 dt = 0.5
-t_end = 120.0
+t_end = 120
 steps = int(t_end / dt)
  
 spray_radius = 5
@@ -74,7 +74,7 @@ for step in range(steps):
         spray_intensity = 0.0
  
     dist = np.sqrt((xx - nozzle_x)**2 + (yy - nozzle_y)**2)
-    spray_mask = (dist <= spray_radius) & mask
+    spray_mask = mask & (dist <= spray_radius)
  
     #apply spray intensity to cooling coefficient
     h_field = np.where(spray_mask, h_spray * spray_intensity, h_ambient)

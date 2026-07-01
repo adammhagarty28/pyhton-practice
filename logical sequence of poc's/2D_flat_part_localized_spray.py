@@ -20,6 +20,8 @@ T = np.full((ny, nx), T_initial)
 cx, cy = nx // 2, ny // 2
 radius = 8
 yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing='ij')
+print(f"yy={yy}")
+print(f"xx={xx}")
 dist_from_center = np.sqrt((xx - cx)**2 + (yy - cy)**2)
 spray_mask = dist_from_center <= radius
 
