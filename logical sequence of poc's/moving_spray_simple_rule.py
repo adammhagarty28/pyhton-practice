@@ -25,6 +25,7 @@ for row in range(0, ny, row_step):
     cols = range(nx) if (row // row_step) % 2 == 0 else range(nx - 1, -1, -1)
     for col in cols:
         path.append((col, row))
+print(f"path={path}")
 
 #map simulation steps to path positions
 #nozzle advances one path point every few timesteps
