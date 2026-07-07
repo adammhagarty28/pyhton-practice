@@ -1,5 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import jax
+import jax.numpy as jnp
 
 #grid setup
 nx, ny = 40, 40              # grid resolution
@@ -29,9 +31,24 @@ spray_mask = dist_from_center <= radius
 h_field = np.where(spray_mask, h_spray, h_ambient)
 
 #simulate
-for step in range(steps):
-    dTdt = -h_field * (T - T_ambient)
-    T = T + dTdt * dt
+#what is used to befor step in range(steps):
+    #dTdt = -h_field * (T - T_ambient)
+    #T = T + dTdt * dt
+
+#what simulate is now w/jax
+# convert to JAX arrays
+T = jnp.array(T)
+h_field_jax = jnp.array(h_field)
+
+@jax.jit
+def step(T):
+    dTdt = -h_field_jax * (T - T_ambient)
+    T_new = T + dTdt * dt
+    return T_new, T_new
+
+T, T_history = jax.lax.scan(step, T, None, length=steps)
+T = np.array(T)
+
 
 #plot
 fig, ax = plt.subplots(figsize=(7, 6))
