@@ -30,8 +30,9 @@ spray_mask = dist_from_center <= radius
 #cooling coefficient field: high where spray hits, low elsewhere
 h_field = np.where(spray_mask, h_spray, h_ambient)
 
-#simulate
-#what is used to befor step in range(steps):
+
+#what simulate used to be:
+#for step in range(steps):
     #dTdt = -h_field * (T - T_ambient)
     #T = T + dTdt * dt
 
@@ -41,12 +42,12 @@ T = jnp.array(T)
 h_field_jax = jnp.array(h_field)
 
 @jax.jit
-def step(T):
+def step(T,_):
     dTdt = -h_field_jax * (T - T_ambient)
     T_new = T + dTdt * dt
     return T_new, T_new
 
-T, T_history = jax.lax.scan(step, T, None, length=steps)
+T, _ = jax.lax.scan(step, T, None, length=steps)
 T = np.array(T)
 
 

@@ -18,9 +18,7 @@ from pulse.lib.pulse import Pulse, PulseParams
 from pulse.lib.warp_kernels import Pose
 from pulse.utils.utils import get_project_mesh_dict
 
-# =============================================================================
 # load mesh
-# =============================================================================
 print("Loading mesh...")
 mesh_dict = get_project_mesh_dict()
 mesh_path = str(mesh_dict["refined_plate"]["obj_path"])
@@ -42,9 +40,8 @@ print(f"Mesh center: {mesh_check.center}")
 print(f"Number of faces: {mesh_check.n_faces}")
 print("Mesh loaded.")
 
-# =============================================================================
+
 # define zigzag nozzle path above the plate
-# =============================================================================
 # refined_plate sits roughly in -0.15 to 0.15 range in x and y
 # nozzle is 0.1m above the plate (z=0.1)
 z_height  = 1.0
@@ -62,9 +59,8 @@ for i, y in enumerate(y_range):
 
 print(f"Total nozzle poses: {len(poses)}")
 
-# =============================================================================
+
 # evaluate spray distribution
-# =============================================================================
 print("Running raycasting...")
 poses_wp   = wp.array(poses, dtype=Pose)
 thicknesses = p.evaluate_pulses(poses_wp)
@@ -75,9 +71,8 @@ print(f"Min thickness: {scaled.min():.6f}")
 print(f"Mean thickness: {scaled.mean():.6f}")
 print(f"Std deviation: {scaled.std():.6f}")
 
-# =============================================================================
+
 # visualize spray distribution on mesh
-# =============================================================================
 print("Visualizing...")
 mesh_pv = pv.read(mesh_path).triangulate()
 

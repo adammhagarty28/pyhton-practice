@@ -21,9 +21,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-# =============================================================================
-# parameters
-# =============================================================================
+#parameters
 nx, ny        = 40, 40
 Lx, Ly        = 0.04, 0.04
 dx            = Lx / (nx - 1)
@@ -51,9 +49,7 @@ print(f"Stability number: {stability:.4f}  (must be < 0.25)")
 if stability >= 0.25:
     raise ValueError("Unstable! Reduce dt or increase dx.")
 
-# =============================================================================
 # initial condition: Gaussian hot spot centered on grid
-# =============================================================================
 x_vals = jnp.linspace(0, Lx, nx)
 y_vals = jnp.linspace(0, Ly, ny)
 XX, YY = jnp.meshgrid(x_vals, y_vals)
@@ -63,9 +59,7 @@ T_init  = T_ambient + (T_initial - T_ambient) * jnp.exp(
     -((XX - cx)**2 + (YY - cy)**2) / (2 * sigma_g**2)
 )
 
-# =============================================================================
-# precompute spray masks for every possible nozzle position
-# =============================================================================
+#precompute spray masks for every possible nozzle position
 yy_np, xx_np = np.meshgrid(np.arange(ny), np.arange(nx), indexing='ij')
 spray_masks = np.zeros((ny * nx, ny, nx), dtype=np.float32)
 for row in range(ny):
@@ -77,9 +71,8 @@ spray_masks_jax = jnp.array(spray_masks)
 xx_np_jax = jnp.array(xx_np)
 yy_np_jax = jnp.array(yy_np)
 
-# =============================================================================
-# JAX step function: greedy hottest-first policy
-# =============================================================================
+#JAX step function: greedy hottest-first policy
+
 
 @jax.jit
 def step(carry, _):
@@ -118,9 +111,7 @@ def step(carry, _):
     output    = (T_new, nozzle_row, nozzle_col)
     return carry_new, output
 
-# =============================================================================
-# run simulation
-# =============================================================================
+#run simulation
 print("Running simulation...")
 init_carry = (T_init, jnp.int32(0), jnp.int32(ny // 2), jnp.int32(nx // 2))
 _, (T_history, nozzle_row_hist, nozzle_col_hist) = jax.lax.scan(
@@ -131,9 +122,7 @@ nozzle_row_hist = np.array(nozzle_row_hist)
 nozzle_col_hist = np.array(nozzle_col_hist)
 print("Done.")
 
-# =============================================================================
-# animation + interactive clicking
-# =============================================================================
+#animation + interactive clicking
 trail_length   = 40
 clicked_points = []
 

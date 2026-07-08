@@ -22,11 +22,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-#jax.config.updatte("jax_enable_x64", True)
+#jax.config.update("jax_enable_x64", True)
 
 #parameters
 nx, ny = 40, 40
-Lx, Ly = 0.04, 0.04 # physical size of grid in meters (40mm x 40mm)
+Lx, Ly = 0.2, 0.2 # physical size of grid in meters (40mm x 40mm)
 dx = Lx / (nx - 1) # node spacing in meters
 
 # material: carbon steel
@@ -37,11 +37,11 @@ rho_c= rho * c # volumetric heat capacity
 alpha= k / rho_c # thermal diffusivity m2/s
 
 # convection to ambient air (no spray yet)
-h= 10.0 # convective heat transfer coefficient W/m2K
+h= 5.0 # convective heat transfer coefficient W/m2K, more realistic for air
 T_ambient= 25.0 #ambient temperature C
 
-dt=0.001 #timestep in seconds
-t_end=10.0 #total simulation time in seconds
+dt=0.01 #timestep in seconds
+t_end=150.0 #total simulation time in seconds
 
 steps=int(t_end/dt) #mumber of timesteps
 
@@ -53,7 +53,7 @@ if stability >= 0.25:
 
 #Gaussian initial condition
 T_peak=900.0 #peak temperature at center C
-sigma_g=.006 #Gaussian widt in meters (6mm)
+sigma_g=.06 #Gaussian width in meters (6mm)
 
 #initial temperature field: Gaussian hot spot centered on grid
 x_vals = jnp.linspace(0, Lx, nx)
@@ -73,10 +73,10 @@ def step(T, _):
     d2Tdx2 = jnp.zeros_like(T)
     d2Tdy2 = jnp.zeros_like(T)
  
-    d2Tdx2 = d2Tdx2.at[1:-1, :].set(
+    d2Tdy2 = d2Tdx2.at[1:-1, :].set(
         (T[2:, :] - 2*T[1:-1, :] + T[:-2, :]) / dx**2
     )
-    d2Tdy2 = d2Tdy2.at[:, 1:-1].set(
+    d2Tdx2 = d2Tdy2.at[:, 1:-1].set(
         (T[:, 2:] - 2*T[:, 1:-1] + T[:, :-2]) / dx**2
     )
     laplacian = d2Tdx2 + d2Tdy2
@@ -89,7 +89,6 @@ def step(T, _):
  
 
 # run simulation via lax.scan
-
 print("Running simulation...")
 T_final, T_history = jax.lax.scan(step, T_init, None, length=steps)
 T_history = np.array(T_history)   # shape: (steps, ny, nx)
