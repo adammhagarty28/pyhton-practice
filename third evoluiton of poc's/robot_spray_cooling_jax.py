@@ -20,6 +20,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pyvista as pv
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 import vtk
 
 from robot_descriptions.loaders.yourdfpy import load_robot_description
@@ -33,11 +35,21 @@ from relevant_PULSE_files.jax_pulse import Pulse
 T_initial     = 900.0
 k             = 50.0
 T_ambient     = 25.0
+
 # PHYSICS CHANGE:
-# OLD: h_spray_scale = 200000.0 was tuned for old graph-Laplacian cooling.
-# NEW: h is now treated as a surface convection coefficient [W/m^2-K].
-#      Cooling divides by rho*c*PLATE_THICKNESS.
+# OLD:
+#   h_spray_scale = 200000.0 was used with the old graph-Laplacian sink:
+#       dTdt = alpha*laplacian - (h/rho_c)*(T - T_ambient)
+#
+# NEW:
+#   h_spray_scale is now treated as a surface convection coefficient [W/m^2-K].
+#   The new heat equation divides cooling by rho*c*PLATE_THICKNESS:
+#       dTdt_spray = -h*(T - T_ambient)/(rho*c*PLATE_THICKNESS)
+#
+# Starting with 2000 W/m^2-K keeps the cooling aggressive but more defensible
+# than the previous dimensionally inconsistent 200000 value.
 h_spray_scale = 2000.0
+
 h_ambient     = 10.0
 c             = 500.0
 rho           = 7800.0
@@ -142,30 +154,130 @@ h_fields = jnp.array(h_fields)
 print("Done precomputing.")
 
 
-#face adjacency
-print("Building face adjacency...")
+
+#geometry-weighted thermal operator
+print("Building geometry-weighted thermal operator...")
+
+# PHYSICS CHANGE:
+# OLD:
+#   We previously used a graph Laplacian:
+#       laplacian = mean_neighbor_temperature - T
+#       dTdt = alpha*laplacian - (h/rho_c)*(T - T_ambient)
+#
+#   That was useful for a POC, but it ignored triangle area, shared-edge length,
+#   centroid spacing, plate thickness, and face thermal mass.
+#
+# NEW:
+#   We now use a finite-volume / FEM-style thermal surface operator:
+#       thermal_mass_i = rho*c*thickness*area_i
+#       G_ij = k*thickness*shared_edge_length / center_distance
+#       dTdt_cond_i = sum_j G_ij*(T_j - T_i) / thermal_mass_i
+#
+#   Spray cooling is now treated as a surface Neumann convection sink:
+#       dTdt_spray_i = -h_i*(T_i - T_ambient)/(rho*c*thickness)
+#
+#   This is the thermal-only piece we actually need from Josh's FEM direction:
+#   transient heat storage + geometry-aware conduction + surface convection.
+
+
+# RESULT COMPARISON:
+# OLD GRAPH-LAPLACIAN PHYSICS TERMINAL RESULT:
+#   Building face adjacency...
+#   Adjacency built.
+#
+#   Final results:
+#     Peak temp:     308.2 C
+#     Min temp:       37.4 C
+#     Temp spread:   270.8 C
+#     Avg temp:       68.5 C
+#
+# NEW GEOMETRY-WEIGHTED THERMAL OPERATOR RESULT:
+#   Building geometry-weighted thermal operator...
+#   Geometry-weighted thermal operator built.
+#     face area: min=9.766e-06, max=9.766e-06
+#     conductance: min=7.500e-01, max=1.500e+00
+#
+#   Final results:
+#     Peak temp:      94.1 C
+#     Min temp:       50.5 C
+#     Temp spread:    43.5 C
+#     Avg temp:       71.3 C
+#
+# INTERPRETATION:
+#   The average temperature stayed in the same general range, but the peak
+#   temperature and spread dropped dramatically. This means the new operator is
+#   not simply "overcooling" the whole plate. Instead, it is redistributing heat
+#   through geometry-aware conduction so corners and boundary regions no longer
+#   remain unrealistically hot.
+#
+#   Old model: useful POC, but graph-based and dimensionally weak.
+#   New model: thermal-only FEM-style bridge using thermal mass, conductance,
+#   plate thickness, and surface convection from the robotic spray field.
+
 mesh_pv  = pv.read(tmp_mesh_path).triangulate()
+points_np = np.array(mesh_pv.points)
 faces_np = np.array(mesh_pv.faces).reshape(-1, 4)[:, 1:]
 
+p0 = points_np[faces_np[:, 0]]
+p1 = points_np[faces_np[:, 1]]
+p2 = points_np[faces_np[:, 2]]
+
+fv_face_centers_np = (p0 + p1 + p2) / 3.0
+fv_face_area_np = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
+fv_face_area_np = np.maximum(fv_face_area_np, 1e-14)
+
 edge_to_faces = defaultdict(list)
+edge_to_length = {}
+
 for fi, face in enumerate(faces_np):
     for j in range(3):
-        edge = tuple(sorted([face[j], face[(j+1)%3]]))
+        a_idx = face[j]
+        b_idx = face[(j + 1) % 3]
+        edge = tuple(sorted([a_idx, b_idx]))
         edge_to_faces[edge].append(fi)
+
+        pa = points_np[a_idx]
+        pb = points_np[b_idx]
+        edge_to_length[edge] = np.linalg.norm(pb - pa)
 
 max_neighbors = 3
 neighbors = -1 * np.ones((n_faces, max_neighbors), dtype=np.int32)
-for fi, face in enumerate(faces_np):
-    nb_count = 0
-    for j in range(3):
-        edge = tuple(sorted([face[j], face[(j+1)%3]]))
-        for fj in edge_to_faces[edge]:
-            if fj != fi and nb_count < max_neighbors:
-                neighbors[fi, nb_count] = fj
-                nb_count += 1
+conductance = np.zeros((n_faces, max_neighbors), dtype=np.float32)
+
+for edge, fs in edge_to_faces.items():
+    if len(fs) != 2:
+        # Boundary edge: no neighbor across this edge.
+        # Boundary/surface cooling is handled through h_field below.
+        continue
+
+    f0, f1 = fs
+    edge_len = edge_to_length[edge]
+
+    c0 = fv_face_centers_np[f0]
+    c1 = fv_face_centers_np[f1]
+    center_dist = max(np.linalg.norm(c1 - c0), 1e-12)
+
+    # Conductance between neighboring triangular control volumes.
+    G = k * PLATE_THICKNESS * edge_len / center_dist
+
+    for a_face, b_face in [(f0, f1), (f1, f0)]:
+        open_slots = np.where(neighbors[a_face] < 0)[0]
+        if len(open_slots) == 0:
+            continue
+
+        slot = open_slots[0]
+        neighbors[a_face, slot] = b_face
+        conductance[a_face, slot] = G
 
 neighbors_jax = jnp.array(neighbors)
-print("Adjacency built.")
+conductance_jax = jnp.array(conductance)
+face_area_jax = jnp.array(fv_face_area_np)
+thermal_mass_jax = rho_c * PLATE_THICKNESS * face_area_jax
+
+positive_G = conductance[conductance > 0]
+print("Geometry-weighted thermal operator built.")
+print(f"  face area: min={fv_face_area_np.min():.3e}, max={fv_face_area_np.max():.3e}")
+print(f"  conductance: min={positive_G.min():.3e}, max={positive_G.max():.3e}")
 
 
 #JAX heat step + rollout
@@ -177,18 +289,21 @@ def step(carry, _):
     pose_idx = jnp.minimum(step_idx // steps_per_move, n_waypoints - 1)
     h_field  = h_fields[pose_idx]
 
-    def get_neighbor_temp(nb_idx):
-        safe_idx = jnp.maximum(nb_idx, 0)
-        return jnp.where(nb_idx >= 0, T[safe_idx], T)
+    safe_neighbors = jnp.where(neighbors_jax >= 0, neighbors_jax, 0)
+    T_neighbors = T[safe_neighbors]
+    valid = (neighbors_jax >= 0).astype(jnp.float32)
 
-    nb_temps  = jax.vmap(get_neighbor_temp)(neighbors_jax.T)
-    valid     = (neighbors_jax.T >= 0).astype(jnp.float32)
-    n_valid   = jnp.maximum(valid.sum(axis=0), 1.0)
-    mean_nb   = (nb_temps * valid).sum(axis=0) / n_valid
-    laplacian = mean_nb - T
+    conductive_power = jnp.sum(
+        conductance_jax * valid * (T_neighbors - T[:, None]),
+        axis=1
+    )
 
-    dTdt  = alpha * laplacian - (h_field / rho_c) * (T - T_ambient)
-    T_new = T + dTdt * dt_sim
+    dTdt_conduction = conductive_power / thermal_mass_jax
+    dTdt_spray = -(h_field / (rho_c * PLATE_THICKNESS)) * (T - T_ambient)
+
+    T_new = T + (dTdt_conduction + dTdt_spray) * dt_sim
+    T_new = jnp.maximum(T_new, T_ambient)
+
     return (T_new, step_idx + 1), (T_new, pose_idx)
 
 print("Running simulation...")
@@ -585,7 +700,96 @@ print("Setting up visualization...")
 mesh_vis = pv.read(tmp_mesh_path).triangulate()
 mesh_vis.cell_data['temperature'] = T_history[0]
 
-plotter = pv.Plotter(off_screen=False, title='UR5e Spray Cooling')
+plotter = pv.Plotter(shape=(1, 2), window_size=(1800, 900))
+# INTERACTIVE TEMPERATURE HISTORY VIEW:
+# LEFT SUBPLOT:
+#   Existing robot + spray + heatmapped plate simulation.
+# RIGHT SUBPLOT:
+#   A normal Matplotlib plot rendered as an image on a PyVista plane.
+#
+# WHY THIS METHOD:
+#   PyVista Chart2D / ChartMPL rendered poorly in this environment.
+#   This approach uses real Matplotlib for clean labels/title/legend/grid, then
+#   displays the plot as an image texture inside the PyVista window.
+
+plotter.subplot(0, 1)
+plotter.set_background("white")
+
+history_curves = []
+history_labels = []
+
+def make_history_plot_image():
+    fig, ax = plt.subplots(figsize=(7.2, 5.2), dpi=130)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    ax.set_title("Clicked plate temperature history", color="black", fontsize=13)
+    ax.set_xlabel("Time (s)", color="black", fontsize=11)
+    ax.set_ylabel("Temperature (°C)", color="black", fontsize=11)
+
+    ax.set_xlim(0.0, (T_history.shape[0] - 1) * dt_sim)
+    ax.set_ylim(T_ambient, T_initial)
+    ax.grid(True, alpha=0.30)
+
+    ax.tick_params(axis="both", colors="black", labelsize=9)
+
+    if len(history_curves) == 0:
+        ax.text(
+            0.5,
+            0.5,
+            "Click the plate on the left\nto add temperature histories",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color="black",
+            alpha=0.65,
+            fontsize=12,
+        )
+    else:
+        for temps, label in zip(history_curves, history_labels):
+            ax.plot(time_axis_history, temps, linewidth=2.0, label=label)
+
+        ax.legend(loc="best", fontsize=8, framealpha=0.9)
+
+    fig.tight_layout()
+
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+
+    w, h = canvas.get_width_height()
+    rgba = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4).copy()
+
+    plt.close(fig)
+    return rgba
+
+# Create the first clean empty plot image.
+time_axis_history = np.arange(T_history.shape[0]) * dt_sim
+history_img = make_history_plot_image()
+
+# Display the Matplotlib image as a PyVista texture on a plane.
+history_texture = pv.Texture(history_img)
+
+history_plane = pv.Plane(
+    center=(0.0, 0.0, 0.0),
+    direction=(0.0, 0.0, 1.0),
+    i_size=1.42,
+    j_size=1.02,
+    i_resolution=1,
+    j_resolution=1,
+)
+
+history_plane_actor = plotter.add_mesh(history_plane, texture=history_texture)
+plotter.camera_position = "xy"
+plotter.camera.zoom(1.15)
+plotter.disable_parallel_projection()
+plotter.enable_parallel_projection()
+
+plotter.subplot(0, 0)
+plotter.set_background("black")
+
+plotter.set_background("black")
+plotter.set_background("black")
+
 plotter.set_background('#0a0a0a')
 plotter.enable_lightkit()
 
@@ -819,9 +1023,124 @@ spray_head_actor.SetVisibility(False)
 
 plotter.camera_position = [(1.22, -1.10, 0.92), (0.36, 0.0, 0.20), (0, 0, 1)]
 plotter.camera.SetClippingRange(0.01, 10.0)
+# clickable plate temperature-history callback
+print("Enabling clickable plate temperature-history picking...")
+
+# Use face centers from the geometry-weighted thermal operator.
+plate_pick_centers = fv_face_centers_np
+
+# Plate-only click filter.
+plate_x_min, plate_x_max = mesh_pv.bounds[0], mesh_pv.bounds[1]
+plate_y_min, plate_y_max = mesh_pv.bounds[2], mesh_pv.bounds[3]
+plate_z_ref = PLATE_Z
+plate_z_tol = 0.050
+plate_xy_pad = 0.015
+
+picked_face_ids = []
+picked_marker_actors = []
+
+def refresh_history_panel():
+    global history_texture, history_plane_actor
+
+    new_img = make_history_plot_image()
+    new_texture = pv.Texture(new_img)
+
+    plotter.subplot(0, 1)
+
+    try:
+        plotter.remove_actor(history_plane_actor)
+    except Exception:
+        pass
+
+    history_plane_actor = plotter.add_mesh(history_plane, texture=new_texture)
+    history_texture = new_texture
+    plotter.camera_position = "xy"
+    plotter.enable_parallel_projection()
+
+    plotter.subplot(0, 0)
+
+
+def add_temperature_curve_from_point(p_click):
+    p_click = np.array(p_click, dtype=float)
+
+    on_plate_z = abs(p_click[2] - plate_z_ref) <= plate_z_tol
+    inside_x = (plate_x_min - plate_xy_pad) <= p_click[0] <= (plate_x_max + plate_xy_pad)
+    inside_y = (plate_y_min - plate_xy_pad) <= p_click[1] <= (plate_y_max + plate_xy_pad)
+
+    if not (on_plate_z and inside_x and inside_y):
+        print(
+            "Ignored click not on plate: "
+            f"x={p_click[0]:.3f}, y={p_click[1]:.3f}, z={p_click[2]:.3f}"
+        )
+        return
+
+    dists = np.linalg.norm(plate_pick_centers - p_click[None, :], axis=1)
+    face_idx = int(np.argmin(dists))
+    center = plate_pick_centers[face_idx]
+
+    if dists[face_idx] > 0.055:
+        print(f"Ignored click too far from plate face: distance={dists[face_idx]:.3f} m")
+        return
+
+    temps = T_history[:, face_idx]
+    label = f"face {face_idx}, x={center[0]:.3f} m, y={center[1]:.3f} m"
+
+    history_curves.append(temps)
+    history_labels.append(label)
+    picked_face_ids.append(face_idx)
+
+    refresh_history_panel()
+
+    # Add marker on plate.
+    plotter.subplot(0, 0)
+    marker_center = center.copy()
+    marker_center[2] = plate_z_ref + 0.006
+
+    marker_sphere = pv.Sphere(radius=0.006, center=marker_center)
+    marker_actor = plotter.add_mesh(marker_sphere, name=f"picked_face_{face_idx}")
+    picked_marker_actors.append(marker_actor)
+
+    print(f"Added temperature history: {label}")
+    plotter.render()
+
+
+def on_click_position_for_history(click_xy):
+    # click_xy is screen position. Convert it to a 3D pick on the left renderer.
+    x, y = int(click_xy[0]), int(click_xy[1])
+
+    picker = pv._vtk.vtkCellPicker()
+    picker.SetTolerance(0.001)
+
+    left_renderer = plotter.renderers[0]
+    picker.Pick(x, y, 0, left_renderer)
+
+    cell_id = picker.GetCellId()
+    if cell_id < 0:
+        print("Ignored click: no mesh cell picked.")
+        return
+
+    p_world = picker.GetPickPosition()
+    add_temperature_curve_from_point(p_world)
+
+
+plotter.subplot(0, 0)
+
+# Use PyVista's click-position tracker instead of Chart2D picking.
+# This records the mouse click position and then we manually pick only against
+# the left renderer.
+plotter.track_click_position(
+    callback=on_click_position_for_history,
+    side="left",
+    viewport=False,
+)
+
+print("Clickable plate temperature-history picking enabled.")
+
 plotter.show(auto_close=False, interactive_update=True)
 
 # animation loop
+
+
 print("Animating...")
 
 # More frames = smoother visual path.
