@@ -30,7 +30,7 @@ alpha        = 0.01
 spray_radius = 16
 dt           = 0.5
 
-# spray timing
+#spray timing
 t_on         = 5.0    #seconds spray is ON
 t_off        = 5.0    #seconds spray is OFF
 t_end        = 60.0   #total simulation time
@@ -99,20 +99,16 @@ fig, axes = plt.subplots(1, 2, figsize=(13, 6))
 ax         = axes[0]
 ax_history = axes[1]
 
-im = ax.imshow(T_history[0], cmap='inferno', origin='lower',
-               vmin=T_ambient, vmax=T_initial)
+im = ax.imshow(T_history[0], cmap='inferno', origin='lower',vmin=T_ambient, vmax=T_initial)
 fig.colorbar(im, ax=ax, label='Temperature (°C)')
 ax.set_title('Pulsed spray cooling')
 ax.set_xlabel('x (nodes)')
 ax.set_ylabel('y (nodes)')
-time_text = ax.text(0.02, 0.95, '', transform=ax.transAxes,
-                    color='white', fontsize=10)
-spray_text = ax.text(0.02, 0.88, '', transform=ax.transAxes,
-                     color='cyan', fontsize=10)
+time_text = ax.text(0.02, 0.95, '', transform=ax.transAxes,color='white', fontsize=10)
+spray_text = ax.text(0.02, 0.88, '', transform=ax.transAxes,color='cyan', fontsize=10)
 
 #spray zone circle
-circle = plt.Circle((cx, cy), spray_radius, color='cyan',
-                     fill=False, linewidth=2, label='Spray zone')
+circle = plt.Circle((cx, cy), spray_radius, color='cyan',fill=False, linewidth=2, label='Spray zone')
 ax.add_patch(circle)
 ax.legend(loc='upper right', fontsize=9)
 
@@ -125,8 +121,7 @@ ax_history.grid(True, alpha=0.3)
 
 #shade spray ON periods on history plot
 for i in range(int(t_end / cycle) + 1):
-    ax_history.axvspan(i * cycle, i * cycle + t_on,
-                       alpha=0.1, color='cyan', label='Spray ON' if i == 0 else '')
+    ax_history.axvspan(i * cycle, i * cycle + t_on,alpha=0.1, color='cyan', label='Spray ON' if i == 0 else '')
 ax_history.legend(fontsize=8, loc='upper right')
 
 skip = max(1, steps // 300)

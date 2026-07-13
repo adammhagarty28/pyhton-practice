@@ -12,23 +12,17 @@ Physics:
     h_local per face = h_ambient + deposit(pose) * h_spray_scale
 """
 
-import sys
-sys.path.insert(0, '/mnt/c/Users/Owner/Downloads/jax-pulse-master/jax-pulse-master')
-sys.path.insert(0, '/mnt/c/Users/Owner/Downloads/jax-pulse-master/jax-pulse-master/lib')
-
+from relevant_PULSE_files.jax_kernels import Pose, deposit
+from relevant_PULSE_files.jax_pulse import Pulse
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pyvista as pv
 import time
 from collections import defaultdict
+import os
 
-from jax_kernels import Pose, deposit
-from jax_pulse import Pulse, PulseParams
-
-# =============================================================================
-# parameters
-# =============================================================================
+#parameters
 T_initial     = 900.0
 k             = 50.0
 T_ambient     = 25.0
@@ -43,18 +37,17 @@ dt            = 0.1
 t_end         = 600.0
 steps         = int(t_end / dt)
 
-# JAX-PULSE parameters
+#JAX-PULSE parameters
 sigma         = 0.8
 a             = 1.0
 ref_dist      = 1.0
 resolution    = 64
 fov           = 90.0
 
-mesh_path = '/mnt/c/Users/Owner/Downloads/jax-pulse-master/jax-pulse-master/data/meshes/obj/refined_plate.obj'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+mesh_path = os.path.join(BASE_DIR, 'relevant_PULSE_files', 'refined_plate.obj')
 
-# =============================================================================
-# load mesh
-# =============================================================================
+#load mesh
 print("Loading mesh...")
 pulse_model = Pulse(
     sigma=sigma, a=a, ref_dist=ref_dist,
@@ -74,9 +67,7 @@ print(f"Mesh loaded. Faces: {n_faces}")
 print(f"Mesh bounds: x [{float(face_v0[:,0].min()):.2f}, {float(face_v0[:,0].max()):.2f}]")
 print(f"             y [{float(face_v0[:,1].min()):.2f}, {float(face_v0[:,1].max()):.2f}]")
 
-# =============================================================================
-# zigzag nozzle path
-# =============================================================================
+#zigzag nozzle path
 z_height = 1.5
 x_range  = np.linspace(0.1, 2.9, 20)
 y_range  = np.linspace(0.1, 2.9, 20)
@@ -96,10 +87,8 @@ pose_positions = jnp.stack([p.position for p in poses])
 pose_rotations = jnp.stack([p.rotation for p in poses])
 steps_per_move = max(1, steps // n_poses)
 
-# =============================================================================
-# precompute h_local for each pose
-# =============================================================================
-print("Precomputing spray distributions...")
+#precompute h_local for each pose
+int("Precomputing spray distributions...")
 
 def compute_h_for_pose(pos, rot):
     weight = deposit(
@@ -112,9 +101,7 @@ h_fields = jax.vmap(compute_h_for_pose)(pose_positions, pose_rotations)
 h_fields = jnp.array(h_fields)
 print("Done precomputing.")
 
-# =============================================================================
-# build face adjacency
-# =============================================================================
+#build face adjacency
 print("Building face adjacency...")
 mesh_pv  = pv.read(mesh_path).triangulate()
 faces_np = np.array(mesh_pv.faces).reshape(-1, 4)[:, 1:]
@@ -139,9 +126,7 @@ for fi, face in enumerate(faces_np):
 neighbors_jax = jnp.array(neighbors)
 print("Adjacency built.")
 
-# =============================================================================
-# JAX step function
-# =============================================================================
+#JAX step function
 T_init = jnp.full((n_faces,), T_initial)
 
 @jax.jit
@@ -166,9 +151,7 @@ def step(carry, _):
 
     return (T_new, step_idx + 1), (T_new, pose_idx)
 
-# =============================================================================
-# run simulation
-# =============================================================================
+#run simulation
 print("Running simulation...")
 _, (T_history, pose_idx_history) = jax.lax.scan(
     step, (T_init, jnp.int32(0)), None, length=steps
@@ -184,9 +167,7 @@ print(f"  Temp spread:  {T_history[-1].max() - T_history[-1].min():.1f} C")
 print(f"  Avg temp:     {T_history[-1].mean():.1f} C")
 print(f"  deposit() max: {float(h_fields.max()):.2f}")
 
-# =============================================================================
-# animated visualization — looping
-# =============================================================================
+#animated visualization — looping
 print("Animating...")
 mesh_vis = pv.read(mesh_path).triangulate()
 mesh_vis.cell_data['temperature'] = T_history[0]
@@ -204,17 +185,12 @@ actor = plotter.add_mesh(
     scalar_bar_args={'title': 'Temperature (°C)'}
 )
 
-path_points = np.array([[p.position[0], p.position[1], p.position[2]]
-                         for p in poses])
+path_points = np.array([[p.position[0], p.position[1], p.position[2]]for p in poses])
 path_pv = pv.Spline(path_points, 1000)
 plotter.add_mesh(path_pv, color='cyan', line_width=2, opacity=0.4)
 
-nozzle_point = pv.PolyData(np.array([[poses[0].position[0],
-                                       poses[0].position[1],
-                                       poses[0].position[2]]],
-                                     dtype=np.float32))
-plotter.add_mesh(nozzle_point, color='cyan',
-                 point_size=20, render_points_as_spheres=True)
+nozzle_point = pv.PolyData(np.array([[poses[0].position[0],poses[0].position[1],poses[0].position[2]]],dtype=np.float32))
+plotter.add_mesh(nozzle_point, color='cyan',point_size=20, render_points_as_spheres=True)
 
 plotter.show(auto_close=False, interactive_update=True)
 
@@ -228,9 +204,6 @@ while True:
         actor.mapper.dataset.Modified()
 
         pidx = int(pose_idx_history[frame])
-        nozzle_point.points = np.array([[poses[pidx].position[0],
-                                          poses[pidx].position[1],
-                                          poses[pidx].position[2]]],
-                                        dtype=np.float32)
+        nozzle_point.points = np.array([[poses[pidx].position[0],poses[pidx].position[1],poses[pidx].position[2]]],dtype=np.float32)
         plotter.render()
         time.sleep(0.03)
