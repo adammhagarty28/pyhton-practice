@@ -1,0 +1,9 @@
+name: spray-cooling-cuda12
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - "-e .[cuda12,dev]"

@@ -7,6 +7,30 @@ name = "spray-cooling-research"
 version = "0.1.0"
 description = "Robotic spray-cooling simulation using JAX, JAX-PULSE, PyVista, and UR5e inverse kinematics."
 requires-python = ">=3.12"
+dependencies = [
+    "numpy==2.4.6",
+    "pyvista==0.44.2",
+    "vtk==9.3.1",
+    "matplotlib==3.10.9",
+    "trimesh==4.12.2",
+    "ikpy==4.0.0",
+    "robot-descriptions==3.0.0",
+    "yourdfpy==0.0.60",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "jax==0.10.1",
+]
+cuda12 = [
+    "jax[cuda12]==0.10.1",
+]
+cuda13 = [
+    "jax[cuda13]==0.10.1",
+]
+dev = [
+    "pytest>=8,<10",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
