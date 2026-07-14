@@ -1,0 +1,37 @@
+[simulation]
+dt_s = 0.1
+end_time_s = 600.0
+
+[thermal]
+initial_temperature_c = 900.0
+ambient_temperature_c = 25.0
+thermal_conductivity_w_mk = 50.0
+density_kg_m3 = 7800.0
+specific_heat_j_kgk = 500.0
+ambient_h_w_m2k = 10.0
+spray_h_scale_w_m2k = 2000.0
+thickness_m = 0.010
+
+[spray]
+sigma = 0.15
+a = 1.0
+reference_distance_m = 0.4
+resolution = 64
+field_of_view_deg = 90.0
+volumetric_flow_rate_m3_s = 1.0e-5
+
+[geometry]
+mesh_path = "data/meshes/refined_plate.obj"
+plate_size_m = 0.4
+plate_center_m = [0.6, 0.0, -0.15]
+
+[path]
+points_per_row = 20
+number_of_rows = 20
+edge_margin_m = 0.01
+nozzle_world_z_m = 0.25
+
+[robot]
+description = "ur5e_description"
+base_position_m = [0.0, 0.0, 0.0]
+visual_nozzle_length_m = 0.22

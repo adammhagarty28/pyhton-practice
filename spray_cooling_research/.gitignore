@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Runtime-generated geometry and robot files
+artifacts/generated/*
+!artifacts/generated/.gitkeep
+_rescaled_plate.obj
+_ur5e_expanded.urdf
+
+# Simulation outputs
+results/*
+!results/.gitkeep
+
+# Local backups
+*.bak
+
+# Editors
+.vscode/
+.idea/

@@ -1,0 +1,24 @@
+Flat-plate baseline before modular refactor
+
+Source:
+    third evoluiton of poc's/robot_spray_cooling_jax.py
+
+Mesh faces:
+    16384
+
+Simulation duration:
+    600.0 s
+
+Final results:
+    Peak temperature:       94.1 C
+    Minimum temperature:    50.5 C
+    Temperature spread:     43.5 C
+    Average temperature:    71.3 C
+
+Regression tolerances during refactor:
+    Peak:       +/- 1.0 C
+    Minimum:    +/- 1.0 C
+    Average:    +/- 1.0 C
+    Spread:     +/- 2.0 C
+
+The physics constants must not change during the architecture refactor.

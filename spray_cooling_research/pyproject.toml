@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spray-cooling-research"
+version = "0.1.0"
+description = "Robotic spray-cooling simulation using JAX, JAX-PULSE, PyVista, and UR5e inverse kinematics."
+requires-python = ">=3.12"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = [
+    "spray_cooling*",
+    "relevant_PULSE_files*",
+]
