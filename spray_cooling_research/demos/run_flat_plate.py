@@ -10,6 +10,15 @@ Physics:
     h_local = h_ambient + deposit(tool0_pose) * h_spray_scale
 """
 
+# IMPORTANT PYVISTA SHUTDOWN NOTE:
+# This application uses a manually updated PyVista/VTK animation loop.
+# On this workstation, closing the native PyVista window with its X button can
+# leave the VTK window in a corrupted update state and cause severe flashing.
+#
+# ALWAYS stop this program from the terminal with Ctrl+C.
+# DO NOT close the PyVista window with the X button.
+#
+
 import os
 import time
 from collections import defaultdict
@@ -701,6 +710,10 @@ def set_actor_matrix(actor, M):
 
 # scene setup
 print("Setting up visualization...")
+print("=" * 72)
+print("PYVISTA SHUTDOWN: return to the terminal and press Ctrl+C.")
+print("DO NOT close the PyVista window with its X button.")
+print("=" * 72)
 
 mesh_vis = pv.read(tmp_mesh_path).triangulate()
 mesh_vis.cell_data['temperature'] = T_history[0]
@@ -788,6 +801,11 @@ plotter.camera_position = "xy"
 plotter.camera.zoom(1.15)
 plotter.disable_parallel_projection()
 plotter.enable_parallel_projection()
+
+# The history graph is a Matplotlib image displayed on a PyVista plane.
+# It should remain fixed rather than accepting 3D rotate, pan, or zoom input.
+# Because subplot (0, 1) is active here, disable() affects the graph renderer.
+plotter.disable()
 
 plotter.subplot(0, 0)
 plotter.set_background("black")
