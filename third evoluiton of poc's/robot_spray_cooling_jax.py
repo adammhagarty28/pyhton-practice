@@ -792,10 +792,22 @@ plotter.set_background("black")
 
 plotter.set_background('#0a0a0a')
 plotter.enable_lightkit()
+plotter.add_axes(
+    line_width=4,
+    x_color='red',
+    y_color='#00ff00',
+    z_color='cyan',
+    xlabel='X (m)',
+    ylabel='Y (m)',
+    zlabel='Z (m)',
+    labels_off=False,
+    color='white',
+)
 
 # ground plane
 ground = pv.Plane(center=(0, 0, -0.005), direction=(0, 0, 1), i_size=2.0, j_size=2.0)
-plotter.add_mesh(ground, color='#151515', show_edges=False)
+ground_actor = plotter.add_mesh(ground, color='#151515', show_edges=False)
+ground_actor.SetPickable(False)
 
 # plate heatmap
 heatmap_actor = plotter.add_mesh(
@@ -823,6 +835,7 @@ for link_name, meshes in scene_geom_by_link.items():
             smooth_shading=True,
             specular=0.4, specular_power=15, ambient=0.25,
         )
+        actor.SetPickable(False)   # exclude robot arm from click picking
         link_actors[link_name].append(actor)
 
 def q_to_cfg(q):
@@ -993,6 +1006,8 @@ spray_head_actor = plotter.add_mesh(
     opacity=0.85,
 )
 
+spray_head_actor.SetPickable(False)
+
 def set_spray_head_position(pos_world):
     M = np.eye(4)
     M[:3, 3] = np.array(pos_world)
@@ -1017,6 +1032,8 @@ spray_actor = plotter.add_mesh(
     render_lines_as_tubes=True,
 )
 
+spray_actor.SetPickable(False)
+
 # Keep spray hidden while IK path is being precomputed.
 spray_actor.SetVisibility(False)
 spray_head_actor.SetVisibility(False)
@@ -1040,24 +1057,18 @@ picked_face_ids = []
 picked_marker_actors = []
 
 def refresh_history_panel():
-    global history_texture, history_plane_actor
+    global history_texture
 
     new_img = make_history_plot_image()
+
+    # Update the existing texture's image data in place instead of
+    # removing and re-adding the actor. This forces the GPU to reupload
+    # the new pixels immediately on next render.
     new_texture = pv.Texture(new_img)
+    history_plane_actor.SetTexture(new_texture)
+    history_texture = new_texture   # hold reference so it doesn't get GC'd
 
-    plotter.subplot(0, 1)
-
-    try:
-        plotter.remove_actor(history_plane_actor)
-    except Exception:
-        pass
-
-    history_plane_actor = plotter.add_mesh(history_plane, texture=new_texture)
-    history_texture = new_texture
-    plotter.camera_position = "xy"
-    plotter.enable_parallel_projection()
-
-    plotter.subplot(0, 0)
+    plotter.render()
 
 
 def add_temperature_curve_from_point(p_click):
@@ -1081,9 +1092,16 @@ def add_temperature_curve_from_point(p_click):
     if dists[face_idx] > 0.055:
         print(f"Ignored click too far from plate face: distance={dists[face_idx]:.3f} m")
         return
+    
+    # skip if we already picked this exact face
+    if face_idx in picked_face_ids:
+        print(f"Face {face_idx} already plotted, skipping.")
+        return
 
     temps = T_history[:, face_idx]
-    label = f"face {face_idx}, x={center[0]:.3f} m, y={center[1]:.3f} m"
+    # Convert world-frame point to robot base frame for meaningful robotics coordinates
+    center_base = center - ROBOT_BASE
+    label = f"({center_base[0]*1000:.0f}, {center_base[1]*1000:.0f}, {center_base[2]*1000:.0f}) mm from base"
 
     history_curves.append(temps)
     history_labels.append(label)
@@ -1104,9 +1122,11 @@ def add_temperature_curve_from_point(p_click):
     plotter.render()
 
 
-def on_click_position_for_history(click_xy):
+def on_click_position_for_history(pick_world):
     # click_xy is screen position. Convert it to a 3D pick on the left renderer.
-    x, y = int(click_xy[0]), int(click_xy[1])
+    print(f"[click received] xy = {pick_world}") 
+    add_temperature_curve_from_point(pick_world)
+
 
     picker = pv._vtk.vtkCellPicker()
     picker.SetTolerance(0.001)
@@ -1251,7 +1271,7 @@ while True:
         spray_actor.mapper.dataset.Modified()
 
         plotter.camera.SetClippingRange(0.01, 10.0)
-        plotter.render()
+        plotter.update(stime=1, force_redraw=True)
 
         elapsed = time.time() - t_start
         if elapsed < FRAME_TIME:
