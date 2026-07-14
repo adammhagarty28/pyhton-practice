@@ -11,3 +11,4 @@ robot-descriptions==3.0.0
 yourdfpy==0.0.60
 jax==0.10.1
 jaxlib==0.10.1
+xacrodoc==2.0.1

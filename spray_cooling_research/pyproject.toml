@@ -16,6 +16,7 @@ dependencies = [
     "ikpy==4.0.0",
     "robot-descriptions==3.0.0",
     "yourdfpy==0.0.60",
+    "xacrodoc==2.0.1",
 ]
 
 [project.optional-dependencies]
