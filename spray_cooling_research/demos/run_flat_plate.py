@@ -29,12 +29,21 @@ from ikpy.chain import Chain
 
 from relevant_PULSE_files.jax_kernels import Pose, deposit
 from relevant_PULSE_files.jax_pulse import Pulse
+from spray_cooling.config import load_config
+
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "configs", "flat_plate.toml")
+RUNTIME_DIR = os.path.join(PROJECT_ROOT, "artifacts", "generated")
+os.makedirs(RUNTIME_DIR, exist_ok=True)
+
+cfg = load_config(CONFIG_PATH, project_root=PROJECT_ROOT)
 
 
 #parameters
-T_initial     = 900.0
-k             = 50.0
-T_ambient     = 25.0
+T_initial     = cfg.thermal.initial_temperature_c
+k             = cfg.thermal.thermal_conductivity_w_mk
+T_ambient     = cfg.thermal.ambient_temperature_c
 
 # PHYSICS CHANGE:
 # OLD:
@@ -48,38 +57,35 @@ T_ambient     = 25.0
 #
 # Starting with 2000 W/m^2-K keeps the cooling aggressive but more defensible
 # than the previous dimensionally inconsistent 200000 value.
-h_spray_scale = 2000.0
+h_spray_scale = cfg.thermal.spray_h_scale_w_m2k
 
-h_ambient     = 10.0
-c             = 500.0
-rho           = 7800.0
+h_ambient     = cfg.thermal.ambient_h_w_m2k
+c             = cfg.thermal.specific_heat_j_kgk
+rho           = cfg.thermal.density_kg_m3
 rho_c         = rho * c
 alpha         = k / rho_c
 
-dt_sim        = 0.1
-t_end         = 600.0
+dt_sim        = cfg.simulation.dt_s
+t_end         = cfg.simulation.end_time_s
 steps         = int(t_end / dt_sim)
 
 #PULSE parameters — sigma stays small since plate is smaller
-sigma         = 0.15    # spray footprint scaling (screen-space angle)
-a             = 1.0
-ref_dist      = 0.4     # ~nozzle-to-plate distance
-resolution    = 64
-fov           = 90.0
+sigma         = cfg.spray.sigma
+a             = cfg.spray.a
+ref_dist      = cfg.spray.reference_distance_m
+resolution    = cfg.spray.resolution
+fov           = cfg.spray.field_of_view_deg
 
 #scene geometry — UR5e reach is 850mm
-PLATE_SIZE   = 0.4                                 # m, plate side length
-PLATE_CENTER = np.array([0.6, 0.0, -0.15])       # plate center in robot base frame
-PLATE_Z      = -0.15                              # plate top surface z (in robot base frame)
-PLATE_THICKNESS = 0.010                         # m, effective thermal mass thickness
-ROBOT_BASE   = np.array([0.0, 0.0, 0.0])          # UR5e base is now the origin
-NOZZLE_Z     = 0.25                               # nozzle z in robot base frame (0.4 m above plate)
-NOZZLE_LENGTH = 0.22                               # visual spray lance length
+PLATE_SIZE   = cfg.geometry.plate_size_m
+PLATE_CENTER = np.array(cfg.geometry.plate_center_m, dtype=float)
+PLATE_Z      = float(PLATE_CENTER[2])
+PLATE_THICKNESS = cfg.thermal.thickness_m
+ROBOT_BASE   = np.array(cfg.robot.base_position_m, dtype=float)
+NOZZLE_Z     = cfg.path.nozzle_world_z_m
+NOZZLE_LENGTH = cfg.robot.visual_nozzle_length_m
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUNTIME_DIR = os.path.join(PROJECT_ROOT, "artifacts", "generated")
-os.makedirs(RUNTIME_DIR, exist_ok=True)
-mesh_path = os.path.join(PROJECT_ROOT, "data", "meshes", "refined_plate.obj")
+mesh_path = os.fspath(cfg.geometry.mesh_path)
 
 
 #load mesh + JAX-PULSE, and rescale plate to PLATE_SIZE
@@ -101,7 +107,7 @@ raw_mesh.save(tmp_mesh_path)
 pulse_model = Pulse(
     sigma=sigma, a=a, ref_dist=ref_dist,
     resolution=resolution, fov=fov,
-    volumetric_flow_rate=1e-5
+    volumetric_flow_rate=cfg.spray.volumetric_flow_rate_m3_s
 )
 pulse_model.load_mesh(tmp_mesh_path)
 
@@ -117,14 +123,14 @@ print(f"Plate bounds: x [{raw_mesh.bounds[0]:.3f}, {raw_mesh.bounds[1]:.3f}]  "
 
 #waypoints — zigzag over plate at NOZZLE_Z
 half = PLATE_SIZE / 2.0
-margin = 0.01                         #keep away from plate edge
+margin = cfg.path.edge_margin_m
 x_min = PLATE_CENTER[0] - half + margin
 x_max = PLATE_CENTER[0] + half - margin
 y_min = PLATE_CENTER[1] - half + margin
 y_max = PLATE_CENTER[1] + half - margin
 
-x_range = np.linspace(x_min, x_max, 20)
-y_range = np.linspace(y_min, y_max, 20)
+x_range = np.linspace(x_min, x_max, cfg.path.points_per_row)
+y_range = np.linspace(y_min, y_max, cfg.path.number_of_rows)
 
 waypoints = []
 for i, y in enumerate(y_range):
@@ -325,7 +331,7 @@ print(f"  Avg temp:     {T_history[-1].mean():.1f} C")
 
 #UR5e URDF load + ikpy chain
 print("Loading UR5e URDF...")
-urdf = load_robot_description("ur5e_description")
+urdf = load_robot_description(cfg.robot.description)
 
 #find URDF file path so ikpy can parse it directly
 #yourdfpy already expanded the xacro when we called load_robot_description above.
