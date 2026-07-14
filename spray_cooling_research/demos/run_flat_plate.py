@@ -30,6 +30,7 @@ from ikpy.chain import Chain
 from relevant_PULSE_files.jax_kernels import Pose, deposit
 from relevant_PULSE_files.jax_pulse import Pulse
 from spray_cooling.config import load_config
+from spray_cooling.geometry.surface_mesh import load_surface_mesh
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -91,18 +92,18 @@ mesh_path = os.fspath(cfg.geometry.mesh_path)
 #load mesh + JAX-PULSE, and rescale plate to PLATE_SIZE
 print("Loading mesh...")
 
-#read raw mesh, rescale from its native 3m x 3m footprint to PLATE_SIZE, and recenter to PLATE_CENTER
-raw_mesh = pv.read(mesh_path).triangulate()
-raw_bounds = raw_mesh.bounds
-raw_x_extent = raw_bounds[1] - raw_bounds[0]
-scale_factor = PLATE_SIZE / raw_x_extent
-raw_mesh.points *= scale_factor
-raw_mesh.points -= raw_mesh.center
-raw_mesh.points += PLATE_CENTER
-
-#save rescaled mesh to temp file so Pulse.load_mesh can read from disk
+# Load, uniformly scale, recenter, and preprocess the triangular surface.
+# The same geometry representation will later be used for half_sphere.obj.
 tmp_mesh_path = os.path.join(RUNTIME_DIR, '_rescaled_plate.obj')
-raw_mesh.save(tmp_mesh_path)
+
+surface_mesh = load_surface_mesh(
+    mesh_path,
+    target_x_extent_m=PLATE_SIZE,
+    center_m=PLATE_CENTER,
+    runtime_path=tmp_mesh_path,
+)
+
+raw_mesh = surface_mesh.polydata
 
 pulse_model = Pulse(
     sigma=sigma, a=a, ref_dist=ref_dist,
@@ -222,17 +223,12 @@ print("Building geometry-weighted thermal operator...")
 #   New model: thermal-only FEM-style bridge using thermal mass, conductance,
 #   plate thickness, and surface convection from the robotic spray field.
 
-mesh_pv  = pv.read(tmp_mesh_path).triangulate()
-points_np = np.array(mesh_pv.points)
-faces_np = np.array(mesh_pv.faces).reshape(-1, 4)[:, 1:]
+mesh_pv = surface_mesh.polydata
+points_np = surface_mesh.points
+faces_np = surface_mesh.faces
 
-p0 = points_np[faces_np[:, 0]]
-p1 = points_np[faces_np[:, 1]]
-p2 = points_np[faces_np[:, 2]]
-
-fv_face_centers_np = (p0 + p1 + p2) / 3.0
-fv_face_area_np = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
-fv_face_area_np = np.maximum(fv_face_area_np, 1e-14)
+fv_face_centers_np = surface_mesh.face_centers
+fv_face_area_np = surface_mesh.face_areas
 
 edge_to_faces = defaultdict(list)
 edge_to_length = {}
