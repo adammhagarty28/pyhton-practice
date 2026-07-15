@@ -150,6 +150,32 @@ def load_surface_mesh(
     if runtime_path is not None:
         output_path = Path(runtime_path).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Weld coincident OBJ vertices before geometric preprocessing.
+        #
+        # Some OBJ files store each triangle with its own three vertex IDs,
+        # even when neighboring triangles occupy identical coordinates.
+        # Without welding, shared-edge adjacency and thermal conduction fail.
+        cell_count_before_cleaning = mesh.n_cells
+        point_count_before_cleaning = mesh.n_points
+
+        mesh = mesh.clean(
+            point_merging=True,
+            tolerance=1.0e-10,
+            absolute=True,
+        ).triangulate()
+
+        if mesh.n_cells != cell_count_before_cleaning:
+            raise RuntimeError(
+                "Mesh cleaning unexpectedly changed the triangle count: "
+                f"{cell_count_before_cleaning} -> {mesh.n_cells}"
+            )
+
+        print(
+            "Mesh topology:"
+            f" welded {point_count_before_cleaning} points "
+            f"to {mesh.n_points} shared points"
+        )
+
         mesh.save(output_path)
 
     points = np.asarray(mesh.points, dtype=float).copy()
