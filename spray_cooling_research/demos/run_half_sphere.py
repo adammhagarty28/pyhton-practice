@@ -309,8 +309,10 @@ robot_facing_xy /= (
     + 1.0e-12
 )
 
+# Copy is essential: NumPy slicing normally returns a view.
+# Normalizing a view here would corrupt the original 3D surface normals.
 path_normal_xy = (
-    hemisphere_path.surface_normals[:, :2]
+    hemisphere_path.surface_normals[:, :2].copy()
 )
 
 path_normal_xy /= (
@@ -421,6 +423,47 @@ base_nozzle_positions = (
     base_impact_positions
     + NOZZLE_SURFACE_STANDOFF
     * base_surface_normals
+)
+
+
+# Geometry invariants: surface normals must remain unit vectors, and the
+# physical nozzle must lie exactly one reference distance from its impact.
+base_normal_magnitudes = np.linalg.norm(
+    base_surface_normals,
+    axis=1,
+)
+
+if not np.allclose(
+    base_normal_magnitudes,
+    1.0,
+    atol=1.0e-10,
+):
+    raise RuntimeError(
+        "Accessible surface normals were corrupted: "
+        f"norm range={base_normal_magnitudes.min():.12f} to "
+        f"{base_normal_magnitudes.max():.12f}."
+    )
+
+base_nozzle_standoffs = np.linalg.norm(
+    base_nozzle_positions
+    - base_impact_positions,
+    axis=1,
+)
+
+if not np.allclose(
+    base_nozzle_standoffs,
+    NOZZLE_SURFACE_STANDOFF,
+    atol=1.0e-10,
+):
+    raise RuntimeError(
+        "Nozzle-to-impact distances are inconsistent: "
+        f"range={base_nozzle_standoffs.min():.12f} to "
+        f"{base_nozzle_standoffs.max():.12f} m."
+    )
+
+print(
+    "PASS: preserved unit surface normals and "
+    f"{NOZZLE_SURFACE_STANDOFF:.3f} m nozzle standoff."
 )
 
 BASE_PASS_WAYPOINT_COUNT = len(
@@ -1073,6 +1116,9 @@ def compute_h_for_pose(pos, rot):
     return h_ambient + weight * h_spray_scale
 
 _spray_cache_hash = hashlib.sha256()
+_spray_cache_hash.update(
+    b"axial_depth_single_pose_diagnostic_v1"
+)
 
 _spray_cache_hash.update(
     np.ascontiguousarray(
@@ -1893,6 +1939,987 @@ print(
 )
 
 
+
+
+
+
+# PHYSICS-WEIGHTED REGION REPORT
+#
+# The ordinary arithmetic mean gives every triangle equal importance even
+# though the triangular thermal capacities vary greatly. The physically
+# meaningful bulk temperature is weighted by thermal capacity.
+final_temperature_for_report = np.asarray(
+    T_history[-1],
+    dtype=np.float64,
+)
+
+dome_region_mask = np.asarray(
+    dome_faces,
+    dtype=bool,
+)
+
+base_region_mask = ~dome_region_mask
+
+if dome_region_mask.shape != (n_faces,):
+    raise RuntimeError(
+        "Dome/base region mask does not match the thermal mesh."
+    )
+
+
+def _capacity_weighted_temperature(mask):
+    regional_capacity = thermal_capacity_np[mask]
+
+    return float(
+        np.sum(
+            regional_capacity
+            * final_temperature_for_report[mask]
+        )
+        / np.sum(regional_capacity)
+    )
+
+
+def _area_weighted_temperature(mask):
+    regional_area = fv_face_area_np[mask]
+
+    return float(
+        np.sum(
+            regional_area
+            * final_temperature_for_report[mask]
+        )
+        / np.sum(regional_area)
+    )
+
+
+def _region_energy_values(mask):
+    initial_region_energy = float(
+        np.sum(
+            thermal_capacity_np[mask]
+            * (
+                T_initial
+                - T_ambient
+            )
+        )
+    )
+
+    final_region_energy = float(
+        np.sum(
+            thermal_capacity_np[mask]
+            * (
+                final_temperature_for_report[mask]
+                - T_ambient
+            )
+        )
+    )
+
+    return (
+        initial_region_energy,
+        final_region_energy,
+        initial_region_energy - final_region_energy,
+    )
+
+
+def _print_region_report(name, mask):
+    if not np.any(mask):
+        print(f"\n{name}: no faces")
+        return
+
+    initial_region_energy, final_region_energy, removed_region_energy = (
+        _region_energy_values(mask)
+    )
+
+    print(f"\n{name}")
+    print(
+        f"  faces:                        "
+        f"{np.count_nonzero(mask)}"
+    )
+    print(
+        f"  surface area:                 "
+        f"{np.sum(fv_face_area_np[mask]):.6f} m^2"
+    )
+    print(
+        f"  total thermal capacity:       "
+        f"{np.sum(thermal_capacity_np[mask]):.2f} J/K"
+    )
+    print(
+        f"  arithmetic mean temperature:  "
+        f"{np.mean(final_temperature_for_report[mask]):.2f} C"
+    )
+    print(
+        f"  area-weighted temperature:    "
+        f"{_area_weighted_temperature(mask):.2f} C"
+    )
+    print(
+        f"  capacity-weighted temperature:"
+        f" {_capacity_weighted_temperature(mask):.2f} C"
+    )
+    print(
+        f"  minimum / maximum:            "
+        f"{np.min(final_temperature_for_report[mask]):.2f} / "
+        f"{np.max(final_temperature_for_report[mask]):.2f} C"
+    )
+    print(
+        f"  initial excess energy:        "
+        f"{initial_region_energy / 1000.0:.2f} kJ"
+    )
+    print(
+        f"  final excess energy:          "
+        f"{final_region_energy / 1000.0:.2f} kJ"
+    )
+    print(
+        f"  energy removed:               "
+        f"{removed_region_energy / 1000.0:.2f} kJ"
+    )
+    print(
+        f"  fraction of initial energy removed: "
+        f"{100.0 * removed_region_energy / initial_region_energy:.2f}%"
+    )
+
+
+global_capacity_weighted_temperature = float(
+    np.sum(
+        thermal_capacity_np
+        * final_temperature_for_report
+    )
+    / np.sum(thermal_capacity_np)
+)
+
+global_area_weighted_temperature = float(
+    np.sum(
+        fv_face_area_np
+        * final_temperature_for_report
+    )
+    / np.sum(fv_face_area_np)
+)
+
+print("\n" + "=" * 76)
+print("PHYSICS-WEIGHTED FINAL TEMPERATURE AND ENERGY REPORT")
+print("=" * 76)
+print(
+    f"Global arithmetic face mean:    "
+    f"{np.mean(final_temperature_for_report):.2f} C"
+)
+print(
+    f"Global area-weighted mean:       "
+    f"{global_area_weighted_temperature:.2f} C"
+)
+print(
+    f"Global capacity-weighted mean:   "
+    f"{global_capacity_weighted_temperature:.2f} C"
+)
+
+_print_region_report(
+    "CURVED DOME REGION",
+    dome_region_mask,
+)
+
+_print_region_report(
+    "FLAT BASE / CLOSURE REGION",
+    base_region_mask,
+)
+
+dome_initial, dome_final, dome_removed = (
+    _region_energy_values(dome_region_mask)
+)
+
+base_initial, base_final, base_removed = (
+    _region_energy_values(base_region_mask)
+)
+
+regional_energy_closure_error = (
+    dome_removed
+    + base_removed
+    - energy_removed
+)
+
+print(
+    "\nRegional energy closure error:  "
+    f"{regional_energy_closure_error:.6e} J"
+)
+
+if abs(regional_energy_closure_error) > 1.0e-5:
+    raise RuntimeError(
+        "Dome/base energy accounting does not reproduce "
+        "the total removed energy."
+    )
+
+print("PASS: dome/base energy accounting closes.")
+print("=" * 76 + "\n")
+
+
+# HOT/COLD FACE DIAGNOSTIC
+#
+# This reports where the final extrema occur and how much direct spray
+# exposure each face accumulated. It does not modify the simulation.
+final_temperature_np = T_history[-1]
+
+face_radial_vectors_np = (
+    fv_face_centers_np
+    - SPHERE_CENTER[None, :]
+)
+
+face_radius_np = np.linalg.norm(
+    face_radial_vectors_np,
+    axis=1,
+)
+
+face_polar_deg_np = np.degrees(
+    np.arccos(
+        np.clip(
+            face_radial_vectors_np[:, 2]
+            / np.maximum(face_radius_np, 1.0e-12),
+            -1.0,
+            1.0,
+        )
+    )
+)
+
+face_azimuth_deg_np = np.degrees(
+    np.arctan2(
+        face_radial_vectors_np[:, 1],
+        face_radial_vectors_np[:, 0],
+    )
+)
+
+path_polar_deg_np = np.degrees(
+    np.arccos(
+        np.clip(
+            base_surface_normals[:, 2],
+            -1.0,
+            1.0,
+        )
+    )
+)
+
+direct_polar_min_deg = float(path_polar_deg_np.min())
+direct_polar_max_deg = float(path_polar_deg_np.max())
+
+inside_direct_polar_band = (
+    (face_polar_deg_np >= direct_polar_min_deg - 1.0e-6)
+    & (face_polar_deg_np <= direct_polar_max_deg + 1.0e-6)
+)
+
+# Count how many actual thermal steps used each scheduled pose.
+pose_step_counts_np = np.bincount(
+    pose_idx_history,
+    minlength=n_waypoints,
+).astype(np.float64)
+
+# Integral of spray-only h over time:
+#     integral[(h_local - h_ambient) dt]
+# Units: J/(m^2 K).
+spray_exposure_np = np.sum(
+    np.maximum(
+        h_fields_np - h_ambient,
+        0.0,
+    )
+    * (
+        pose_step_counts_np
+        * dt_sim
+    )[:, None],
+    axis=0,
+)
+
+maximum_spray_exposure = float(
+    spray_exposure_np.max()
+)
+
+spray_exposure_percent_np = (
+    100.0
+    * spray_exposure_np
+    / max(maximum_spray_exposure, 1.0e-12)
+)
+
+radius_error_mm_np = (
+    1000.0
+    * np.abs(
+        face_radius_np - SPHERE_RADIUS
+    )
+)
+
+
+def _print_face_diagnostic(title, face_indices):
+    print(f"\n{title}")
+    print(
+        " rank  face   temp(C)      centroid xyz (mm)"
+        "        polar   azimuth   exposure   path   radius error"
+    )
+
+    for rank, face_index in enumerate(face_indices, start=1):
+        center_mm = (
+            1000.0
+            * fv_face_centers_np[face_index]
+        )
+
+        print(
+            f" {rank:>4d}  "
+            f"{face_index:>4d}  "
+            f"{final_temperature_np[face_index]:>8.2f}  "
+            f"({center_mm[0]:>7.1f},"
+            f" {center_mm[1]:>7.1f},"
+            f" {center_mm[2]:>7.1f})  "
+            f"{face_polar_deg_np[face_index]:>7.2f}  "
+            f"{face_azimuth_deg_np[face_index]:>8.2f}  "
+            f"{spray_exposure_percent_np[face_index]:>7.2f}%  "
+            f"{'IN ' if inside_direct_polar_band[face_index] else 'OUT'}    "
+            f"{radius_error_mm_np[face_index]:>8.2f} mm"
+        )
+
+
+hottest_face_indices = np.argsort(
+    final_temperature_np
+)[-10:][::-1]
+
+coldest_face_indices = np.argsort(
+    final_temperature_np
+)[:10]
+
+print("\n" + "=" * 76)
+print("FINAL HOT/COLD FACE DIAGNOSTIC")
+print("=" * 76)
+print(
+    f"Direct path polar band: "
+    f"{direct_polar_min_deg:.2f} to "
+    f"{direct_polar_max_deg:.2f} deg"
+)
+
+_print_face_diagnostic(
+    "10 HOTTEST FINAL FACES",
+    hottest_face_indices,
+)
+
+_print_face_diagnostic(
+    "10 COLDEST FINAL FACES",
+    coldest_face_indices,
+)
+
+for region_name, region_mask in (
+    ("inside direct polar band", inside_direct_polar_band),
+    ("outside direct polar band", ~inside_direct_polar_band),
+):
+    if np.any(region_mask):
+        area_weighted_temperature = np.average(
+            final_temperature_np[region_mask],
+            weights=fv_face_area_np[region_mask],
+        )
+
+        print(
+            f"\n{region_name}:"
+            f" faces={np.count_nonzero(region_mask)},"
+            f" area-weighted mean={area_weighted_temperature:.2f} C,"
+            f" peak={final_temperature_np[region_mask].max():.2f} C,"
+            f" minimum={final_temperature_np[region_mask].min():.2f} C"
+        )
+
+print("=" * 76 + "\n")
+
+
+
+# SPRAY FOOTPRINT ALIGNMENT DIAGNOSTIC
+#
+# Compare the commanded material-space impact point with:
+#   1. the maximum-h face,
+#   2. the area-weighted center of the deposited spray field.
+#
+# No simulation values are modified.
+spray_pose_indices_np = np.flatnonzero(
+    spray_enabled_schedule
+)
+
+dome_face_mask_np = np.asarray(
+    dome_faces,
+    dtype=bool,
+)
+
+if dome_face_mask_np.shape != (n_faces,):
+    raise RuntimeError(
+        "Dome-face mask does not match the thermal mesh."
+    )
+
+centroid_miss_mm = []
+peak_miss_mm = []
+polar_offset_deg = []
+footprint_rms_mm = []
+dome_capture_percent = []
+footprint_rows = []
+
+
+def _polar_angle_deg(point):
+    radial = (
+        np.asarray(point, dtype=float)
+        - SPHERE_CENTER
+    )
+
+    radius = np.linalg.norm(radial)
+
+    return float(
+        np.degrees(
+            np.arccos(
+                np.clip(
+                    radial[2] / max(radius, 1.0e-12),
+                    -1.0,
+                    1.0,
+                )
+            )
+        )
+    )
+
+
+for pose_index in spray_pose_indices_np:
+    intended_material = _world_point_to_material(
+        scheduled_impact_positions[pose_index],
+        turntable_angles[pose_index],
+    )
+
+    spray_only_h = np.maximum(
+        h_fields_np[pose_index] - h_ambient,
+        0.0,
+    )
+
+    all_weights = (
+        spray_only_h
+        * fv_face_area_np
+    )
+
+    dome_weights = all_weights.copy()
+    dome_weights[~dome_face_mask_np] = 0.0
+
+    total_weight = float(all_weights.sum())
+    dome_weight = float(dome_weights.sum())
+
+    if dome_weight <= 1.0e-15:
+        raise RuntimeError(
+            f"Spray pose {pose_index} deposited no measurable dome weight."
+        )
+
+    weighted_center = np.sum(
+        dome_weights[:, None]
+        * fv_face_centers_np,
+        axis=0,
+    ) / dome_weight
+
+    dome_h = spray_only_h.copy()
+    dome_h[~dome_face_mask_np] = -np.inf
+
+    peak_face = int(
+        np.argmax(dome_h)
+    )
+
+    centroid_miss = 1000.0 * float(
+        np.linalg.norm(
+            weighted_center - intended_material
+        )
+    )
+
+    peak_miss = 1000.0 * float(
+        np.linalg.norm(
+            fv_face_centers_np[peak_face]
+            - intended_material
+        )
+    )
+
+    intended_polar = _polar_angle_deg(
+        intended_material
+    )
+
+    centroid_polar = _polar_angle_deg(
+        weighted_center
+    )
+
+    polar_offset = (
+        centroid_polar - intended_polar
+    )
+
+    squared_distance = np.sum(
+        (
+            fv_face_centers_np
+            - weighted_center[None, :]
+        ) ** 2,
+        axis=1,
+    )
+
+    rms_width = 1000.0 * float(
+        np.sqrt(
+            np.sum(
+                dome_weights * squared_distance
+            ) / dome_weight
+        )
+    )
+
+    capture = (
+        100.0 * dome_weight
+        / max(total_weight, 1.0e-15)
+    )
+
+    centroid_miss_mm.append(centroid_miss)
+    peak_miss_mm.append(peak_miss)
+    polar_offset_deg.append(polar_offset)
+    footprint_rms_mm.append(rms_width)
+    dome_capture_percent.append(capture)
+
+    footprint_rows.append(
+        (
+            int(pose_index),
+            intended_polar,
+            centroid_polar,
+            polar_offset,
+            centroid_miss,
+            peak_miss,
+            rms_width,
+            capture,
+        )
+    )
+
+
+centroid_miss_mm = np.asarray(centroid_miss_mm)
+peak_miss_mm = np.asarray(peak_miss_mm)
+polar_offset_deg = np.asarray(polar_offset_deg)
+footprint_rms_mm = np.asarray(footprint_rms_mm)
+dome_capture_percent = np.asarray(dome_capture_percent)
+
+print("\n" + "=" * 76)
+print("SPRAY FOOTPRINT ALIGNMENT DIAGNOSTIC")
+print("=" * 76)
+print(f"Spray-on poses analyzed: {len(spray_pose_indices_np)}")
+
+print(
+    "Area-weighted centroid miss:"
+    f" mean={centroid_miss_mm.mean():.2f} mm,"
+    f" median={np.median(centroid_miss_mm):.2f} mm,"
+    f" max={centroid_miss_mm.max():.2f} mm"
+)
+
+print(
+    "Peak-h face miss:"
+    f" mean={peak_miss_mm.mean():.2f} mm,"
+    f" median={np.median(peak_miss_mm):.2f} mm,"
+    f" max={peak_miss_mm.max():.2f} mm"
+)
+
+print(
+    "Centroid polar offset:"
+    f" mean={polar_offset_deg.mean():+.2f} deg,"
+    f" mean absolute={np.mean(np.abs(polar_offset_deg)):.2f} deg,"
+    f" max absolute={np.max(np.abs(polar_offset_deg)):.2f} deg"
+)
+
+print(
+    "Effective RMS footprint width:"
+    f" mean={footprint_rms_mm.mean():.2f} mm,"
+    f" max={footprint_rms_mm.max():.2f} mm"
+)
+
+print(
+    "Spray weight captured by dome:"
+    f" mean={dome_capture_percent.mean():.2f}%,"
+    f" minimum={dome_capture_percent.min():.2f}%"
+)
+
+print("\n10 WORST CENTROID MISSES")
+print(
+    " pose  intended  centroid  offset"
+    "   centroid miss  peak miss  RMS width  dome capture"
+)
+
+worst_rows = sorted(
+    footprint_rows,
+    key=lambda row: row[4],
+    reverse=True,
+)[:10]
+
+for row in worst_rows:
+    print(
+        f"{row[0]:>5d}"
+        f"  {row[1]:>7.2f}°"
+        f"  {row[2]:>7.2f}°"
+        f"  {row[3]:>+7.2f}°"
+        f"  {row[4]:>10.2f} mm"
+        f"  {row[5]:>8.2f} mm"
+        f"  {row[6]:>8.2f} mm"
+        f"  {row[7]:>9.2f}%"
+    )
+
+print("\nACCUMULATED DOME EXPOSURE BY POLAR BAND")
+print(" band       faces   mean exposure   peak exposure")
+
+polar_bin_edges = np.arange(
+    0.0,
+    95.0,
+    5.0,
+)
+
+for lower, upper in zip(
+    polar_bin_edges[:-1],
+    polar_bin_edges[1:],
+):
+    band_mask = (
+        dome_face_mask_np
+        & (face_polar_deg_np >= lower)
+        & (face_polar_deg_np < upper)
+    )
+
+    if not np.any(band_mask):
+        continue
+
+    mean_exposure = np.average(
+        spray_exposure_percent_np[band_mask],
+        weights=fv_face_area_np[band_mask],
+    )
+
+    peak_exposure = float(
+        spray_exposure_percent_np[band_mask].max()
+    )
+
+    print(
+        f"{lower:>4.0f}-{upper:<4.0f}°"
+        f"  {np.count_nonzero(band_mask):>6d}"
+        f"      {mean_exposure:>8.2f}%"
+        f"        {peak_exposure:>8.2f}%"
+    )
+
+print("=" * 76 + "\n")
+
+
+
+# SINGLE-POSE SPRAY PROJECTION DIAGNOSTIC
+#
+# Examine one commanded 8-degree pose and compare the intended surface
+# face with the face receiving maximum spray. No physics is modified.
+spray_pose_indices_single = np.flatnonzero(
+    spray_enabled_schedule
+)
+
+intended_material_points_single = np.asarray(
+    [
+        _world_point_to_material(
+            scheduled_impact_positions[index],
+            turntable_angles[index],
+        )
+        for index in spray_pose_indices_single
+    ],
+    dtype=float,
+)
+
+intended_radial_single = (
+    intended_material_points_single
+    - SPHERE_CENTER[None, :]
+)
+
+intended_polar_single = np.degrees(
+    np.arccos(
+        np.clip(
+            intended_radial_single[:, 2]
+            / np.maximum(
+                np.linalg.norm(
+                    intended_radial_single,
+                    axis=1,
+                ),
+                1.0e-12,
+            ),
+            -1.0,
+            1.0,
+        )
+    )
+)
+
+selected_local_index = int(
+    np.argmin(intended_polar_single)
+)
+
+selected_pose_index = int(
+    spray_pose_indices_single[selected_local_index]
+)
+
+selected_nozzle = np.asarray(
+    pose_positions[selected_pose_index],
+    dtype=float,
+)
+
+selected_quaternion = np.asarray(
+    pose_rotations[selected_pose_index],
+    dtype=float,
+)
+
+selected_impact = intended_material_points_single[
+    selected_local_index
+]
+
+selected_rotation = SciRotation.from_quat(
+    selected_quaternion
+)
+
+forward_plus_z = selected_rotation.apply(
+    np.array([0.0, 0.0, 1.0])
+)
+
+forward_minus_z = selected_rotation.apply(
+    np.array([0.0, 0.0, -1.0])
+)
+
+intended_direction = (
+    selected_impact - selected_nozzle
+)
+
+intended_direction /= (
+    np.linalg.norm(intended_direction)
+    + 1.0e-12
+)
+
+
+def _angle_between_deg(vector_a, vector_b):
+    vector_a = np.asarray(vector_a, dtype=float)
+    vector_b = np.asarray(vector_b, dtype=float)
+
+    vector_a /= np.linalg.norm(vector_a) + 1.0e-12
+    vector_b /= np.linalg.norm(vector_b) + 1.0e-12
+
+    return float(
+        np.degrees(
+            np.arccos(
+                np.clip(
+                    np.dot(vector_a, vector_b),
+                    -1.0,
+                    1.0,
+                )
+            )
+        )
+    )
+
+
+selected_spray_weight = np.maximum(
+    h_fields_np[selected_pose_index] - h_ambient,
+    0.0,
+)
+
+intended_face_index = int(
+    np.argmin(
+        np.sum(
+            (
+                fv_face_centers_np
+                - selected_impact[None, :]
+            ) ** 2,
+            axis=1,
+        )
+    )
+)
+
+dome_weight_single = selected_spray_weight.copy()
+dome_weight_single[~np.asarray(dome_faces, dtype=bool)] = -np.inf
+
+peak_dome_face_index = int(
+    np.argmax(dome_weight_single)
+)
+
+peak_all_face_index = int(
+    np.argmax(selected_spray_weight)
+)
+
+face_normals_single = np.asarray(
+    face_normals,
+    dtype=float,
+)
+
+half_fov_tangent = np.tan(
+    np.radians(fov / 2.0)
+)
+
+
+def _face_projection_row(name, face_index):
+    center = fv_face_centers_np[face_index]
+    relative = center - selected_nozzle
+
+    local = selected_rotation.inv().apply(
+        relative
+    )
+
+    x_local, y_local, z_local = local
+
+    projected_x = (
+        x_local
+        / (
+            z_local * half_fov_tangent
+            + 1.0e-8
+        )
+    )
+
+    projected_y = (
+        y_local
+        / (
+            z_local * half_fov_tangent
+            + 1.0e-8
+        )
+    )
+
+    projected_radius = float(
+        np.sqrt(
+            projected_x ** 2
+            + projected_y ** 2
+        )
+    )
+
+    gaussian = float(
+        np.exp(
+            -0.5
+            * projected_radius ** 2
+            / (
+                sigma ** 2
+                + 1.0e-8
+            )
+        )
+    )
+
+    distance = float(
+        np.linalg.norm(relative)
+    )
+
+    to_nozzle = (
+        -relative
+        / (
+            distance
+            + 1.0e-12
+        )
+    )
+
+    normal = face_normals_single[face_index]
+    incidence = abs(
+        float(
+            np.dot(
+                normal,
+                to_nozzle,
+            )
+        )
+    )
+
+    falloff = float(
+        (
+            ref_dist
+            / (
+                z_local
+                + 1.0e-8
+            )
+        ) ** 2
+    )
+
+    predicted_weight = (
+        a
+        * gaussian
+        * incidence
+        * falloff
+    )
+
+    center_radial = center - SPHERE_CENTER
+    center_polar = float(
+        np.degrees(
+            np.arccos(
+                np.clip(
+                    center_radial[2]
+                    / (
+                        np.linalg.norm(center_radial)
+                        + 1.0e-12
+                    ),
+                    -1.0,
+                    1.0,
+                )
+            )
+        )
+    )
+
+    miss_mm = 1000.0 * float(
+        np.linalg.norm(
+            center - selected_impact
+        )
+    )
+
+    axis_angle = _angle_between_deg(
+        relative,
+        forward_plus_z,
+    )
+
+    print(f"\n{name}")
+    print(f"  face index:          {face_index}")
+    print(f"  face polar angle:    {center_polar:.3f} deg")
+    print(f"  impact miss:         {miss_mm:.3f} mm")
+    print(
+        "  center xyz:          "
+        f"{np.array2string(center, precision=6)}"
+    )
+    print(
+        "  local xyz:           "
+        f"{np.array2string(local, precision=6)}"
+    )
+    print(f"  angle from +Z axis:  {axis_angle:.3f} deg")
+    print(f"  projected radius:    {projected_radius:.6f}")
+    print(f"  Gaussian factor:     {gaussian:.6e}")
+    print(f"  incidence factor:    {incidence:.6e}")
+    print(f"  axial falloff:       {falloff:.6e}")
+    print(f"  predicted weight:    {predicted_weight:.6e}")
+    print(
+        "  actual PULSE weight: "
+        f"{selected_spray_weight[face_index]:.6e}"
+    )
+
+
+print("\n" + "=" * 76)
+print("SINGLE-POSE SPRAY PROJECTION DIAGNOSTIC")
+print("=" * 76)
+print(f"Selected schedule pose: {selected_pose_index}")
+print(
+    "Intended polar angle: "
+    f"{intended_polar_single[selected_local_index]:.3f} deg"
+)
+print(
+    "Nozzle position:      "
+    f"{np.array2string(selected_nozzle, precision=6)}"
+)
+print(
+    "Intended impact:      "
+    f"{np.array2string(selected_impact, precision=6)}"
+)
+print(
+    "Quaternion XYZW:      "
+    f"{np.array2string(selected_quaternion, precision=6)}"
+)
+print(
+    "Local +Z direction:   "
+    f"{np.array2string(forward_plus_z, precision=6)}"
+)
+print(
+    "Local -Z direction:   "
+    f"{np.array2string(forward_minus_z, precision=6)}"
+)
+print(
+    "Nozzle-to-impact:     "
+    f"{np.array2string(intended_direction, precision=6)}"
+)
+print(
+    "Angle +Z to impact:   "
+    f"{_angle_between_deg(forward_plus_z, intended_direction):.6f} deg"
+)
+print(
+    "Angle -Z to impact:   "
+    f"{_angle_between_deg(forward_minus_z, intended_direction):.6f} deg"
+)
+print(
+    "Depth weighting active in deposit(): "
+    "NO — active function overwrites soft_depth_weight with 1.0"
+)
+
+_face_projection_row(
+    "INTENDED-IMPACT NEAREST FACE",
+    intended_face_index,
+)
+
+_face_projection_row(
+    "MAXIMUM-H DOME FACE",
+    peak_dome_face_index,
+)
+
+if peak_all_face_index != peak_dome_face_index:
+    _face_projection_row(
+        "MAXIMUM-H FACE OVERALL",
+        peak_all_face_index,
+    )
+
+print("=" * 76 + "\n")
 
 
 #UR5e URDF load + ikpy chain
