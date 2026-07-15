@@ -1,0 +1,24 @@
+# Direct runtime dependencies for the robotic spray-cooling POC.
+#
+# This file documents project-level Python dependencies.
+# The canonical SIMCenter environment is `jax-forge`.
+#
+# Do not automatically create a new environment from this file.
+# Install missing packages into the existing jax-forge environment
+# when required.
+#
+# JAX/JAXLIB installation may depend on the target machine and CUDA
+# configuration, so GPU-specific installation should be handled
+# deliberately rather than blindly recreated from another machine.
+
+jax
+jaxlib
+numpy
+scipy
+matplotlib
+pyvista
+vtk
+trimesh
+ikpy
+robot-descriptions
+yourdfpy

@@ -52,10 +52,12 @@ def build_hemisphere_path(
     sphere_center: np.ndarray,
     sphere_radius: float,
     ring_count: int,
-    points_per_ring: int,
+    points_per_ring: int | np.ndarray,
     polar_min_deg: float,
     polar_max_deg: float,
     standoff: float,
+    azimuth_center_rad: float | None = None,
+    azimuth_half_span_deg: float | None = None,
 ) -> HemispherePath:
     """
     Build alternating circular passes over a hemispherical dome.
@@ -73,9 +75,6 @@ def build_hemisphere_path(
     if ring_count < 2:
         raise ValueError("ring_count must be at least 2.")
 
-    if points_per_ring < 4:
-        raise ValueError("points_per_ring must be at least 4.")
-
     if not 0.0 <= polar_min_deg < polar_max_deg < 90.0:
         raise ValueError(
             "Polar angles must satisfy "
@@ -92,20 +91,90 @@ def build_hemisphere_path(
         ring_count,
     )
 
+    if np.isscalar(points_per_ring):
+        ring_point_counts = np.full(
+            ring_count,
+            int(points_per_ring),
+            dtype=int,
+        )
+    else:
+        ring_point_counts = np.asarray(
+            points_per_ring,
+            dtype=int,
+        )
+
+        if ring_point_counts.shape != (ring_count,):
+            raise ValueError(
+                "Variable points_per_ring must contain exactly "
+                f"{ring_count} entries."
+            )
+
+    minimum_points = (
+        2
+        if azimuth_half_span_deg is not None
+        else 4
+    )
+
+    if np.any(ring_point_counts < minimum_points):
+        raise ValueError(
+            "Every ring must contain at least "
+            f"{minimum_points} points."
+        )
+
+    if (
+        azimuth_center_rad is None
+    ) != (
+        azimuth_half_span_deg is None
+    ):
+        raise ValueError(
+            "azimuth_center_rad and azimuth_half_span_deg "
+            "must either both be provided or both be omitted."
+        )
+
     surface_points: list[np.ndarray] = []
     surface_normals: list[np.ndarray] = []
     tool_positions: list[np.ndarray] = []
     pulse_rotations: list[np.ndarray] = []
 
     for ring_index, polar in enumerate(polar_angles):
-        azimuths = np.linspace(
-            0.0,
-            2.0 * np.pi,
-            points_per_ring,
-            endpoint=False,
+        point_count = int(
+            ring_point_counts[ring_index]
         )
 
-        # Alternating direction prevents a full-circle jump between rings.
+        if azimuth_half_span_deg is None:
+            azimuths = np.linspace(
+                0.0,
+                2.0 * np.pi,
+                point_count,
+                endpoint=False,
+            )
+        else:
+            half_span_rad = np.deg2rad(
+                float(azimuth_half_span_deg)
+            )
+
+            if not 0.0 < half_span_rad <= np.pi:
+                raise ValueError(
+                    "azimuth_half_span_deg must be in (0, 180]."
+                )
+
+            # Slightly inset the endpoints so a later numerical
+            # accessibility check does not reject points exactly on
+            # the angular boundary.
+            angular_epsilon = 1.0e-8
+
+            azimuths = np.linspace(
+                float(azimuth_center_rad)
+                - half_span_rad
+                + angular_epsilon,
+                float(azimuth_center_rad)
+                + half_span_rad
+                - angular_epsilon,
+                point_count,
+                endpoint=True,
+            )
+
+        # Alternate direction to keep successive rings spatially connected.
         if ring_index % 2 == 1:
             azimuths = azimuths[::-1]
 

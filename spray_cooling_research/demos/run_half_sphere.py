@@ -284,21 +284,28 @@ HEMISPHERE_STANDOFF = (
     + NOZZLE_LENGTH
 )
 
-hemisphere_path = build_hemisphere_path(
-    sphere_center=SPHERE_CENTER,
-    sphere_radius=SPHERE_RADIUS,
-    ring_count=12,
-    points_per_ring=32,
-    polar_min_deg=8.0,
-    polar_max_deg=50.0,
-    standoff=HEMISPHERE_STANDOFF,
-)
-
-# FIXED-BASE COLLISION-REDUCTION SECTOR
+# AREA-AWARE HEMISPHERE BENCHMARK PATH
 #
-# A stationary UR5e cannot safely reach around the entire back side of the
-# dome without link-part collisions. Keep only the upper sector facing the
-# robot. Full-surface coverage requires robot repositioning or a turntable.
+# Equal points per polar ring severely oversample the apex because the
+# physical circumference of a spherical ring scales with sin(theta).
+#
+# Preserve the same 132 accessible spray poses used by the previous
+# benchmark, but distribute them according to ring circumference.
+# This keeps total spray pose count and process timing directly comparable.
+AREA_AWARE_RING_COUNT = 12
+AREA_AWARE_TOTAL_WAYPOINTS = 132
+AREA_AWARE_POLAR_MIN_DEG = 8.0
+AREA_AWARE_POLAR_MAX_DEG = 75.0
+
+# Geometric accessibility limit used as an independent validation.
+ACCESSIBLE_HALF_ANGLE_DEG = 65.0
+
+# The original validated 32-point full-ring discretization had 11.25-degree
+# spacing, so the outermost retained poses inside the +/-65-degree sector
+# were actually at +/-56.25 degrees rather than directly on the boundary.
+# Preserve that previously demonstrated IK-safe sampling extent.
+AREA_AWARE_PATH_HALF_SPAN_DEG = 56.25
+
 robot_facing_xy = (
     ROBOT_BASE[:2]
     - SPHERE_CENTER[:2]
@@ -309,8 +316,139 @@ robot_facing_xy /= (
     + 1.0e-12
 )
 
-# Copy is essential: NumPy slicing normally returns a view.
-# Normalizing a view here would corrupt the original 3D surface normals.
+robot_facing_azimuth_rad = np.arctan2(
+    robot_facing_xy[1],
+    robot_facing_xy[0],
+)
+
+area_aware_polar_angles_deg = np.linspace(
+    AREA_AWARE_POLAR_MIN_DEG,
+    AREA_AWARE_POLAR_MAX_DEG,
+    AREA_AWARE_RING_COUNT,
+)
+
+# For equal meridional spacing on a sphere, the area associated with a
+# ring grows approximately in proportion to sin(theta).
+area_weights = np.sin(
+    np.deg2rad(
+        area_aware_polar_angles_deg
+    )
+)
+
+raw_ring_counts = (
+    AREA_AWARE_TOTAL_WAYPOINTS
+    * area_weights
+    / np.sum(area_weights)
+)
+
+area_aware_ring_counts = np.floor(
+    raw_ring_counts
+).astype(int)
+
+area_aware_ring_counts = np.maximum(
+    area_aware_ring_counts,
+    2,
+)
+
+remaining_points = (
+    AREA_AWARE_TOTAL_WAYPOINTS
+    - int(
+        np.sum(
+            area_aware_ring_counts
+        )
+    )
+)
+
+if remaining_points > 0:
+    fractional_order = np.argsort(
+        -(
+            raw_ring_counts
+            - np.floor(
+                raw_ring_counts
+            )
+        )
+    )
+
+    for ring_index in fractional_order[
+        :remaining_points
+    ]:
+        area_aware_ring_counts[
+            ring_index
+        ] += 1
+
+elif remaining_points < 0:
+    removable_order = np.argsort(
+        raw_ring_counts
+        - np.floor(
+            raw_ring_counts
+        )
+    )
+
+    points_to_remove = -remaining_points
+
+    for ring_index in removable_order:
+        if points_to_remove == 0:
+            break
+
+        if area_aware_ring_counts[
+            ring_index
+        ] > 2:
+            area_aware_ring_counts[
+                ring_index
+            ] -= 1
+
+            points_to_remove -= 1
+
+    if points_to_remove != 0:
+        raise RuntimeError(
+            "Could not construct an area-aware ring allocation "
+            "with the required total waypoint count."
+        )
+
+if int(
+    np.sum(
+        area_aware_ring_counts
+    )
+) != AREA_AWARE_TOTAL_WAYPOINTS:
+    raise RuntimeError(
+        "Area-aware ring counts do not sum to the required "
+        f"{AREA_AWARE_TOTAL_WAYPOINTS} waypoints."
+    )
+
+print(
+    "Area-aware hemisphere path:"
+)
+print(
+    f"  polar range:            "
+    f"{AREA_AWARE_POLAR_MIN_DEG:.1f} to "
+    f"{AREA_AWARE_POLAR_MAX_DEG:.1f} deg"
+)
+print(
+    f"  requested waypoints:    "
+    f"{AREA_AWARE_TOTAL_WAYPOINTS}"
+)
+print(
+    f"  points per ring:        "
+    f"{area_aware_ring_counts.tolist()}"
+)
+
+hemisphere_path = build_hemisphere_path(
+    sphere_center=SPHERE_CENTER,
+    sphere_radius=SPHERE_RADIUS,
+    ring_count=AREA_AWARE_RING_COUNT,
+    points_per_ring=area_aware_ring_counts,
+    polar_min_deg=AREA_AWARE_POLAR_MIN_DEG,
+    polar_max_deg=AREA_AWARE_POLAR_MAX_DEG,
+    standoff=HEMISPHERE_STANDOFF,
+    azimuth_center_rad=robot_facing_azimuth_rad,
+    azimuth_half_span_deg=AREA_AWARE_PATH_HALF_SPAN_DEG,
+)
+
+# FIXED-BASE COLLISION-REDUCTION SECTOR
+#
+# The path generator already creates points only inside this sector.
+# Keep the geometric accessibility check as an independent validation.
+
 path_normal_xy = (
     hemisphere_path.surface_normals[:, :2].copy()
 )
@@ -323,8 +461,6 @@ path_normal_xy /= (
     )
     + 1.0e-12
 )
-
-ACCESSIBLE_HALF_ANGLE_DEG = 65.0
 
 facing_alignment = (
     path_normal_xy
