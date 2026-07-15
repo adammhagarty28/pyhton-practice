@@ -26,3 +26,10 @@ results/*
 # Editors
 .vscode/
 .idea/
+
+# Python-generated files
+
+# Runtime-generated spray-cooling artifacts
+
+# Simulation logs and disposable results
+results/
