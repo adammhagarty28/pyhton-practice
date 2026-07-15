@@ -41,6 +41,10 @@ from relevant_PULSE_files.jax_pulse import Pulse
 from spray_cooling.config import load_config
 from spray_cooling.geometry.surface_mesh import load_surface_mesh
 from spray_cooling.robotics.trajectory import smooth_joint_path, unwrap_to_reference
+from spray_cooling.spray.pulse_model import compute_h_for_pose
+from spray_cooling.geometry.queries import nearest_surface_point_and_normal, resolve_mesh_path
+from spray_cooling.robotics.runtime import world_to_base, set_initial_joint, q_to_cfg, get_tool0_transform_world, get_tool0_world, get_nozzle_tip_world, get_nozzle_direction_world
+from spray_cooling.visualization.common import set_actor_matrix, set_spray_head_position
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -161,12 +165,6 @@ rot = jnp.array([1.0, 0.0, 0.0, 0.0])                # 180° about x -> point -Z
 pose_positions = jnp.array(np.array(waypoints))
 pose_rotations = jnp.tile(rot, (n_waypoints, 1))
 
-def compute_h_for_pose(pos, rot):
-    weight = deposit(
-        pos, rot, sigma, a, ref_dist, resolution,
-        face_v0, face_v1, face_v2, face_normals, n_faces, fov
-    )
-    return h_ambient + weight * h_spray_scale
 
 h_fields = jax.vmap(compute_h_for_pose)(pose_positions, pose_rotations)
 h_fields = jnp.array(h_fields)
@@ -392,28 +390,17 @@ NOZZLE_DOWN_R = np.array([
 ])
 
 # ikpy target position is in robot base frame; convert world -> base
-def world_to_base(pos_world):
-    # Robot base is now the origin, so world frame == robot base frame
-    return np.array(pos_world)
 
 _last_joint_state = np.zeros(len(chain.links))
 
-def set_initial_joint(name, value):
-    """Set initial joint value by joint name, not by fragile hardcoded index."""
-    global _last_joint_state
-    for idx, link in enumerate(chain.links):
-        if link.name == name:
-            _last_joint_state[idx] = value
-            return
-    print(f"WARNING: joint {name} not found in ikpy chain")
 
 # arm extended forward and slightly down — closer to typical spray poses
-set_initial_joint("shoulder_pan_joint", 0.0)
-set_initial_joint("shoulder_lift_joint", -1.5708)
-set_initial_joint("elbow_joint", 1.5708)
-set_initial_joint("wrist_1_joint", -1.5708)
-set_initial_joint("wrist_2_joint", -1.5708)
-set_initial_joint("wrist_3_joint", 0.0)
+set_initial_joint(_last_joint_state, chain, "shoulder_pan_joint", 0.0)
+set_initial_joint(_last_joint_state, chain, "shoulder_lift_joint", -1.5708)
+set_initial_joint(_last_joint_state, chain, "elbow_joint", 1.5708)
+set_initial_joint(_last_joint_state, chain, "wrist_1_joint", -1.5708)
+set_initial_joint(_last_joint_state, chain, "wrist_2_joint", -1.5708)
+set_initial_joint(_last_joint_state, chain, "wrist_3_joint", 0.0)
 
 
 
@@ -430,34 +417,6 @@ face_v2_np = np.array(face_v2)
 face_centers_np = (face_v0_np + face_v1_np + face_v2_np) / 3.0
 face_normals_np = np.array(face_normals)
 
-def nearest_surface_point_and_normal(nozzle_world):
-    """
-    Return nearest mesh face center and outward normal relative to nozzle_world.
-
-    For the flat plate:
-      surface point ~= [x, y, 0]
-      normal ~= [0, 0, 1]
-
-    For future curved geometry:
-      normal becomes the local triangle normal, flipped so it points toward the nozzle.
-    """
-    nozzle_world = np.array(nozzle_world, dtype=float)
-
-    # Nearest face center to current nozzle/target position.
-    diff = face_centers_np - nozzle_world[None, :]
-    idx = int(np.argmin(np.sum(diff * diff, axis=1)))
-
-    p_surf = face_centers_np[idx].copy()
-    n = face_normals_np[idx].copy()
-    n = n / (np.linalg.norm(n) + 1e-8)
-
-    # Flip normal so it points from surface toward nozzle.
-    # This is crucial for spheres / irregular surfaces later.
-    to_nozzle = nozzle_world - p_surf
-    if np.dot(n, to_nozzle) < 0.0:
-        n = -n
-
-    return p_surf, n
 
 
 
@@ -473,7 +432,7 @@ def solve_ik_direct(target_world):
     target_world = np.array(target_world, dtype=float)
     target_base = world_to_base(target_world)
 
-    _, n_world = nearest_surface_point_and_normal(target_world)
+    _, n_world = nearest_surface_point_and_normal(face_centers_np, face_normals_np, target_world)
 
     try:
         q_raw = chain.inverse_kinematics(
@@ -506,7 +465,7 @@ def solve_ik(target_world):
     target_world = np.array(target_world, dtype=float)
     target_base = world_to_base(target_world)
 
-    _, n_world = nearest_surface_point_and_normal(target_world)
+    _, n_world = nearest_surface_point_and_normal(face_centers_np, face_normals_np, target_world)
 
     try:
         q_raw = chain.inverse_kinematics(
@@ -565,32 +524,6 @@ root = tree.getroot()
 # ourselves using the URDF file directory as the resolution root.
 urdf_dir = os.path.dirname(urdf_file)
 
-def resolve_mesh_path(filename_attr):
-    """Convert URDF mesh filename to an absolute path on disk."""
-    if filename_attr.startswith("package://"):
-        # strip package://<pkg>/ and look under the ur_description repo
-        stripped = filename_attr[len("package://"):]
-        # first path segment is the package name
-        parts = stripped.split("/", 1)
-        if len(parts) == 2:
-            # ur5e_description module has REPOSITORY_PATH — try that root
-            from robot_descriptions import ur5e_description as ur_mod
-            candidate = os.path.join(ur_mod.REPOSITORY_PATH, parts[1])
-            if os.path.exists(candidate):
-                return candidate
-            # fallback: search under REPOSITORY_PATH recursively
-            target_name = os.path.basename(parts[1])
-            for r, _, files in os.walk(ur_mod.REPOSITORY_PATH):
-                if target_name in files:
-                    return os.path.join(r, target_name)
-    elif filename_attr.startswith("file://"):
-        return filename_attr[len("file://"):]
-    else:
-        # relative path — try relative to URDF file dir
-        candidate = os.path.join(urdf_dir, filename_attr)
-        if os.path.exists(candidate):
-            return candidate
-    return None
 
 # for each URDF link, collect its visual mesh files (in link-local frame)
 # and the visual origin transform (link-local offset).
@@ -620,7 +553,7 @@ for link_elem in root.findall("link"):
         mesh_elem = geometry.find("mesh")
         if mesh_elem is None:
             continue
-        mesh_file = resolve_mesh_path(mesh_elem.get("filename"))
+        mesh_file = resolve_mesh_path(urdf_dir, mesh_elem.get("filename"))
         if mesh_file is None or not os.path.exists(mesh_file):
             print(f"  skip {link_name}: mesh not found ({mesh_elem.get('filename')})")
             continue
@@ -652,13 +585,6 @@ for link_elem in root.findall("link"):
 
 print(f"Total links with meshes: {len(scene_geom_by_link)}")
 
-def set_actor_matrix(actor, M):
-    """Apply a 4x4 numpy matrix to a vtk actor."""
-    vtk_m = vtk.vtkMatrix4x4()
-    for i in range(4):
-        for j in range(4):
-            vtk_m.SetElement(i, j, M[i, j])
-    actor.SetUserMatrix(vtk_m)
 
 # scene setup
 print("Setting up visualization...")
@@ -848,22 +774,10 @@ for link_name, meshes in scene_geom_by_link.items():
         actor.SetPickable(False)   # exclude robot arm from click picking
         link_actors[link_name].append(actor)
 
-def q_to_cfg(q):
-    """
-    Convert ikpy q vector into a yourdfpy config dictionary.
-
-    Do this by matching joint names, not by assuming q[i + 1].
-    This prevents ikpy's OriginLink or fixed links from shifting the UR5e joints.
-    """
-    cfg = {}
-    for idx, link in enumerate(chain.links):
-        if link.name in UR5E_JOINT_NAMES:
-            cfg[link.name] = float(q[idx])
-    return cfg
 
 def update_ur5e_pose(q):
     """Set URDF config, then push each link's world transform to its actors."""
-    cfg = q_to_cfg(q)
+    cfg = q_to_cfg(UR5E_JOINT_NAMES, chain, q)
     urdf.update_cfg(cfg)
 
     for link_name, actors in link_actors.items():
@@ -872,42 +786,12 @@ def update_ur5e_pose(q):
         for actor in actors:
             set_actor_matrix(actor, T_world)
 
-def get_tool0_transform_world(q):
-    """Return full tool0 transform in world coordinates."""
-    cfg = q_to_cfg(q)
-    urdf.update_cfg(cfg)
-
-    T_tool0 = np.array(urdf.get_transform("tool0"))
-    return robot_base_T @ T_tool0
 
 
-def get_tool0_world(q):
-    """Return tool0 position in world coordinates."""
-    return get_tool0_transform_world(q)[:3, 3]
 
 
-def get_nozzle_tip_world(q):
-    """
-    Return physical nozzle exit position.
-
-    The visual nozzle points along local -Z from tool0, so the tip is
-    NOZZLE_LENGTH below tool0 in the tool0 local frame.
-    """
-    T_tool0_world = get_tool0_transform_world(q)
-    tip_local = np.array([0.0, 0.0, -NOZZLE_LENGTH, 1.0])
-    return (T_tool0_world @ tip_local)[:3]
 
 
-def get_nozzle_direction_world(q):
-    """
-    Return spray direction in world coordinates.
-
-    The nozzle sprays along local -Z of tool0.
-    """
-    T_tool0_world = get_tool0_transform_world(q)
-    local_minus_z = np.array([0.0, 0.0, -1.0])
-    d = T_tool0_world[:3, :3] @ local_minus_z
-    return d / (np.linalg.norm(d) + 1e-8)
 
 
 
@@ -1017,20 +901,16 @@ spray_head_actor = plotter.add_mesh(
 )
 spray_head_actor.SetPickable(False)
 
-def set_spray_head_position(pos_world):
-    M = np.eye(4)
-    M[:3, 3] = np.array(pos_world)
-    set_actor_matrix(spray_head_actor, M)
 
 # initial pose + pressure jet actor
 q_init = solve_ik_direct(np.array(waypoints[0]))
 _last_joint_state = q_init.copy()
 update_ur5e_pose(q_init)
 
-tool0_init = get_tool0_world(q_init)
+tool0_init = get_tool0_world(UR5E_JOINT_NAMES, chain, robot_base_T, urdf, q_init)
 impact_init = np.array(waypoints[0], dtype=float)
 
-set_spray_head_position(tool0_init)
+set_spray_head_position(spray_head_actor, tool0_init)
 
 spray_poly = make_pressure_jet(tool0_init, impact_init, 0.0)
 spray_actor = plotter.add_mesh(
@@ -1244,8 +1124,8 @@ spray_head_actor.SetVisibility(True)
 q_first = q_anim_path[0]
 update_ur5e_pose(q_first)
 
-tool0_first = get_tool0_world(q_first)
-set_spray_head_position(tool0_first)
+tool0_first = get_tool0_world(UR5E_JOINT_NAMES, chain, robot_base_T, urdf, q_first)
+set_spray_head_position(spray_head_actor, tool0_first)
 
 # ------------------------------------------------------------------
 # Replay cached trajectory.
@@ -1267,18 +1147,18 @@ while True:
         update_ur5e_pose(q)
 
         # Tool0 should now be approximately normal to local mesh surface.
-        tool0_world = get_tool0_world(q)
+        tool0_world = get_tool0_world(UR5E_JOINT_NAMES, chain, robot_base_T, urdf, q)
         jet_origin = tool0_world.copy()
 
         # Impact point comes from nearest mesh surface, not hardcoded plate z.
         # This is what will matter on sphere / irregular 3D shapes.
-        impact_center, surf_normal = nearest_surface_point_and_normal(target)
+        impact_center, surf_normal = nearest_surface_point_and_normal(face_centers_np, face_normals_np, target)
 
-        set_spray_head_position(jet_origin)
+        set_spray_head_position(spray_head_actor, jet_origin)
 
         if j == 0:
             err_world = np.linalg.norm(tool0_world - target)
-            alignment = np.dot(get_nozzle_direction_world(q), -surf_normal)
+            alignment = np.dot(get_nozzle_direction_world(UR5E_JOINT_NAMES, chain, robot_base_T, urdf, q), -surf_normal)
             print(f"Start-of-pass tool0 tracking error: {err_world:.3f} m")
             print(f"Start-of-pass spray-normal alignment: {alignment:.3f}")
 
