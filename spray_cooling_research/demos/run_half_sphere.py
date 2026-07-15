@@ -370,10 +370,10 @@ print(
 
 
 # Tool0 targets used by the UR5e inverse-kinematics solver.
-# THREE-PASS INDEXED TURNTABLE
+# RING-INTERLEAVED INDEXED TURNTABLE
 #
 # The UR5e repeats one physically accessible world-space sector.
-# Between passes, the part rotates while the spray is disabled.
+# The part indexes after each small group of rings while spray is disabled.
 #
 # The thermal mesh remains in material coordinates. For each turntable
 # angle, the world-space nozzle pose is transformed back into the rotating
@@ -383,8 +383,19 @@ TURNTABLE_PASS_ANGLES_DEG = np.array(
     dtype=float,
 )
 
-INDEX_DWELL_WAYPOINTS = 8
-FINAL_RETURN_WAYPOINTS = 24
+# CONTROLLED RING-INTERLEAVING EXPERIMENT
+#
+# Preserve the baseline schedule size:
+#     396 spray-on poses
+#      40 spray-off poses
+#     436 total poses
+#
+# Two rings are cooled at all three indexed orientations before moving to
+# the next two-ring group. This changes cooling order without changing the
+# total simulated process time or total spray exposure.
+RINGS_PER_INTERLEAVED_GROUP = 2
+INTER_BLOCK_TRANSITION_WAYPOINTS = 2
+FINAL_RETURN_WAYPOINTS = 6
 
 base_tool_positions = np.asarray(
     hemisphere_path.tool_positions,
@@ -537,24 +548,225 @@ def _append_schedule_pose(
     )
 
 
-for pass_index, pass_angle_deg in enumerate(
-    TURNTABLE_PASS_ANGLES_DEG
+# The accessible mask preserves the original flattened ring ordering.
+# Recover contiguous ring boundaries from the constant normal-z value on
+# each polar ring.
+ring_break_indices = (
+    np.flatnonzero(
+        np.abs(
+            np.diff(
+                base_surface_normals[:, 2]
+            )
+        )
+        > 1.0e-10
+    )
+    + 1
+)
+
+base_ring_waypoint_indices = [
+    ring_indices.astype(int)
+    for ring_indices in np.split(
+        np.arange(
+            BASE_PASS_WAYPOINT_COUNT,
+            dtype=int,
+        ),
+        ring_break_indices,
+    )
+]
+
+if len(base_ring_waypoint_indices) < 2:
+    raise RuntimeError(
+        "Failed to recover multiple hemisphere rings from the "
+        "accessible waypoint path."
+    )
+
+if any(
+    len(ring_indices) == 0
+    for ring_indices in base_ring_waypoint_indices
 ):
+    raise RuntimeError(
+        "Recovered an empty hemisphere ring."
+    )
+
+if sum(
+    len(ring_indices)
+    for ring_indices in base_ring_waypoint_indices
+) != BASE_PASS_WAYPOINT_COUNT:
+    raise RuntimeError(
+        "Recovered ring waypoint counts do not match the "
+        "accessible-sector waypoint count."
+    )
+
+ring_waypoint_counts = np.asarray(
+    [
+        len(ring_indices)
+        for ring_indices in base_ring_waypoint_indices
+    ],
+    dtype=int,
+)
+
+ring_waypoint_groups = []
+
+for ring_start in range(
+    0,
+    len(base_ring_waypoint_indices),
+    RINGS_PER_INTERLEAVED_GROUP,
+):
+    ring_waypoint_groups.append(
+        np.concatenate(
+            base_ring_waypoint_indices[
+                ring_start:
+                ring_start
+                + RINGS_PER_INTERLEAVED_GROUP
+            ]
+        )
+    )
+
+
+# Build the spray blocks before adding spray-off transitions.
+#
+# Even groups:
+#     0 -> 120 -> 240 degrees
+#
+# Odd groups:
+#     240 -> 120 -> 0 degrees
+#
+# This avoids accumulating continuous turntable rotation while still
+# exposing every ring group to all three material orientations.
+schedule_blocks = []
+
+for ring_group_index, ring_group_indices in enumerate(
+    ring_waypoint_groups
+):
+    if ring_group_index % 2 == 0:
+        group_angles_deg = (
+            TURNTABLE_PASS_ANGLES_DEG
+        )
+    else:
+        group_angles_deg = (
+            TURNTABLE_PASS_ANGLES_DEG[::-1]
+        )
+
+    for local_pass_index, pass_angle_deg in enumerate(
+        group_angles_deg
+    ):
+        # Reverse the middle pass so consecutive orientations share the
+        # same robot endpoint whenever possible.
+        if local_pass_index % 2 == 0:
+            order = ring_group_indices.copy()
+        else:
+            order = ring_group_indices[::-1].copy()
+
+        schedule_blocks.append(
+            (
+                int(ring_group_index),
+                float(pass_angle_deg),
+                order,
+            )
+        )
+
+
+# Confirm that every accessible waypoint is sprayed exactly once at each
+# material orientation.
+expected_base_indices = np.arange(
+    BASE_PASS_WAYPOINT_COUNT,
+    dtype=int,
+)
+
+for required_angle_deg in TURNTABLE_PASS_ANGLES_DEG:
+    indices_at_angle = np.concatenate(
+        [
+            order
+            for _, block_angle_deg, order
+            in schedule_blocks
+            if np.isclose(
+                block_angle_deg,
+                required_angle_deg,
+            )
+        ]
+    )
+
+    if not np.array_equal(
+        np.sort(indices_at_angle),
+        expected_base_indices,
+    ):
+        raise RuntimeError(
+            "Ring-interleaved schedule does not cover every "
+            f"accessible waypoint exactly once at "
+            f"{required_angle_deg:.1f} degrees."
+        )
+
+
+def _normalized_linear_interpolation(
+    start_vector,
+    end_vector,
+    fraction,
+):
+    interpolated = (
+        (1.0 - fraction)
+        * np.asarray(start_vector, dtype=float)
+        + fraction
+        * np.asarray(end_vector, dtype=float)
+    )
+
+    magnitude = np.linalg.norm(interpolated)
+
+    if magnitude <= 1.0e-12:
+        raise RuntimeError(
+            "Cannot normalize a near-zero transition vector."
+        )
+
+    return interpolated / magnitude
+
+
+def _interpolate_quaternion(
+    start_quaternion,
+    end_quaternion,
+    fraction,
+):
+    quaternion_start = np.asarray(
+        start_quaternion,
+        dtype=float,
+    )
+
+    quaternion_end = np.asarray(
+        end_quaternion,
+        dtype=float,
+    )
+
+    # q and -q represent the same rotation. Choose the shorter
+    # interpolation direction.
+    if np.dot(
+        quaternion_start,
+        quaternion_end,
+    ) < 0.0:
+        quaternion_end = -quaternion_end
+
+    interpolated = (
+        (1.0 - fraction)
+        * quaternion_start
+        + fraction
+        * quaternion_end
+    )
+
+    magnitude = np.linalg.norm(interpolated)
+
+    if magnitude <= 1.0e-12:
+        raise RuntimeError(
+            "Cannot normalize a near-zero transition quaternion."
+        )
+
+    return interpolated / magnitude
+
+
+for block_index, (
+    ring_group_index,
+    pass_angle_deg,
+    order,
+) in enumerate(schedule_blocks):
     pass_angle_rad = np.deg2rad(
         pass_angle_deg
     )
-
-    # Alternate direction so one pass ends where the next begins.
-    if pass_index % 2 == 0:
-        order = np.arange(
-            BASE_PASS_WAYPOINT_COUNT
-        )
-    else:
-        order = np.arange(
-            BASE_PASS_WAYPOINT_COUNT - 1,
-            -1,
-            -1,
-        )
 
     for waypoint_index in order:
         _append_schedule_pose(
@@ -567,50 +779,132 @@ for pass_index, pass_angle_deg in enumerate(
             True,
         )
 
-    if pass_index < (
-        len(TURNTABLE_PASS_ANGLES_DEG) - 1
+    if block_index >= len(schedule_blocks) - 1:
+        continue
+
+    _, next_angle_deg, next_order = (
+        schedule_blocks[
+            block_index + 1
+        ]
+    )
+
+    next_angle_rad = np.deg2rad(
+        next_angle_deg
+    )
+
+    current_endpoint_index = int(
+        order[-1]
+    )
+
+    next_startpoint_index = int(
+        next_order[0]
+    )
+
+    for transition_index in range(
+        INTER_BLOCK_TRANSITION_WAYPOINTS
     ):
-        next_angle_rad = np.deg2rad(
-            TURNTABLE_PASS_ANGLES_DEG[
-                pass_index + 1
+        fraction = (
+            transition_index + 1
+        ) / (
+            INTER_BLOCK_TRANSITION_WAYPOINTS
+            + 1
+        )
+
+        transition_tool_position = (
+            (1.0 - fraction)
+            * base_tool_positions[
+                current_endpoint_index
+            ]
+            + fraction
+            * base_tool_positions[
+                next_startpoint_index
             ]
         )
 
-        endpoint_index = int(
-            order[-1]
+        transition_impact_position = (
+            (1.0 - fraction)
+            * base_impact_positions[
+                current_endpoint_index
+            ]
+            + fraction
+            * base_impact_positions[
+                next_startpoint_index
+            ]
         )
 
-        indexing_angles = np.linspace(
-            pass_angle_rad,
-            next_angle_rad,
-            INDEX_DWELL_WAYPOINTS + 2,
-        )[1:-1]
-
-        for indexing_angle in indexing_angles:
-            _append_schedule_pose(
-                base_tool_positions[endpoint_index],
-                base_impact_positions[endpoint_index],
-                base_surface_normals[endpoint_index],
-                base_nozzle_positions[endpoint_index],
-                base_pulse_quaternions[endpoint_index],
-                indexing_angle,
-                False,
+        transition_surface_normal = (
+            _normalized_linear_interpolation(
+                base_surface_normals[
+                    current_endpoint_index
+                ],
+                base_surface_normals[
+                    next_startpoint_index
+                ],
+                fraction,
             )
+        )
+
+        transition_nozzle_position = (
+            (1.0 - fraction)
+            * base_nozzle_positions[
+                current_endpoint_index
+            ]
+            + fraction
+            * base_nozzle_positions[
+                next_startpoint_index
+            ]
+        )
+
+        transition_quaternion = (
+            _interpolate_quaternion(
+                base_pulse_quaternions[
+                    current_endpoint_index
+                ],
+                base_pulse_quaternions[
+                    next_startpoint_index
+                ],
+                fraction,
+            )
+        )
+
+        transition_angle_rad = (
+            (1.0 - fraction)
+            * pass_angle_rad
+            + fraction
+            * next_angle_rad
+        )
+
+        _append_schedule_pose(
+            transition_tool_position,
+            transition_impact_position,
+            transition_surface_normal,
+            transition_nozzle_position,
+            transition_quaternion,
+            transition_angle_rad,
+            False,
+        )
 
 
-# Return safely to the initial robot pose while the table completes
-# 240 degrees -> 360 degrees, equivalent to zero degrees.
+# Return the robot to the first accessible waypoint with spray disabled.
+# With an even number of ring groups the table already ends at zero
+# degrees; the angle interpolation also handles future odd group counts.
+final_block_angle_rad = np.deg2rad(
+    schedule_blocks[-1][1]
+)
+
+final_endpoint_index = int(
+    schedule_blocks[-1][2][-1]
+)
+
 return_indices = np.linspace(
-    BASE_PASS_WAYPOINT_COUNT - 1,
+    final_endpoint_index,
     0,
     FINAL_RETURN_WAYPOINTS,
 ).astype(int)
 
 return_angles = np.linspace(
-    np.deg2rad(
-        TURNTABLE_PASS_ANGLES_DEG[-1]
-    ),
-    2.0 * np.pi,
+    final_block_angle_rad,
+    0.0,
     FINAL_RETURN_WAYPOINTS,
 )
 
@@ -626,6 +920,35 @@ for waypoint_index, return_angle in zip(
         base_pulse_quaternions[waypoint_index],
         return_angle,
         False,
+    )
+
+
+expected_spray_pose_count = (
+    len(TURNTABLE_PASS_ANGLES_DEG)
+    * BASE_PASS_WAYPOINT_COUNT
+)
+
+expected_spray_off_pose_count = (
+    (
+        len(schedule_blocks) - 1
+    )
+    * INTER_BLOCK_TRANSITION_WAYPOINTS
+    + FINAL_RETURN_WAYPOINTS
+)
+
+if len(scheduled_tool_positions) != (
+    expected_spray_pose_count
+    + expected_spray_off_pose_count
+):
+    raise RuntimeError(
+        "Unexpected ring-interleaved schedule length."
+    )
+
+if np.count_nonzero(
+    scheduled_spray_enabled
+) != expected_spray_pose_count:
+    raise RuntimeError(
+        "Unexpected ring-interleaved spray-on pose count."
     )
 
 
@@ -676,13 +999,33 @@ steps_per_move = max(
     steps // n_waypoints,
 )
 
-print("Indexed turntable schedule:")
+print("Ring-interleaved indexed turntable schedule:")
 print(
-    f"  passes:                  "
+    f"  recovered rings:         "
+    f"{len(base_ring_waypoint_indices)}"
+)
+print(
+    f"  waypoints per ring:      "
+    f"{ring_waypoint_counts.tolist()}"
+)
+print(
+    f"  rings per group:         "
+    f"{RINGS_PER_INTERLEAVED_GROUP}"
+)
+print(
+    f"  ring groups:             "
+    f"{len(ring_waypoint_groups)}"
+)
+print(
+    f"  spray blocks:            "
+    f"{len(schedule_blocks)}"
+)
+print(
+    f"  indexed orientations:    "
     f"{len(TURNTABLE_PASS_ANGLES_DEG)}"
 )
 print(
-    f"  sector waypoints/pass:   "
+    f"  accessible waypoints:    "
     f"{BASE_PASS_WAYPOINT_COUNT}"
 )
 print(
@@ -694,9 +1037,29 @@ print(
     f"{np.count_nonzero(spray_enabled_schedule)}"
 )
 print(
-    f"  indexing/return poses:   "
+    f"  transition/return poses: "
     f"{np.count_nonzero(~spray_enabled_schedule)}"
 )
+
+if n_waypoints != 436:
+    raise RuntimeError(
+        "Controlled comparison requires exactly 436 scheduled poses; "
+        f"received {n_waypoints}."
+    )
+
+if np.count_nonzero(
+    spray_enabled_schedule
+) != 396:
+    raise RuntimeError(
+        "Controlled comparison requires exactly 396 spray-on poses."
+    )
+
+if np.count_nonzero(
+    ~spray_enabled_schedule
+) != 40:
+    raise RuntimeError(
+        "Controlled comparison requires exactly 40 spray-off poses."
+    )
 
 print("Precomputing indexed-turntable spray distributions...")
 
