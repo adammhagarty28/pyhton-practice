@@ -41,10 +41,11 @@ from relevant_PULSE_files.jax_pulse import Pulse
 from spray_cooling.config import load_config
 from spray_cooling.geometry.surface_mesh import load_surface_mesh
 from spray_cooling.robotics.trajectory import smooth_joint_path, unwrap_to_reference
-from spray_cooling.spray.pulse_model import compute_h_for_pose
+from spray_cooling.spray.pulse_model import make_compute_h_for_pose
 from spray_cooling.geometry.queries import nearest_surface_point_and_normal, resolve_mesh_path
 from spray_cooling.robotics.runtime import world_to_base, set_initial_joint, q_to_cfg, get_tool0_transform_world, get_tool0_world, get_nozzle_tip_world, get_nozzle_direction_world
 from spray_cooling.visualization.common import set_actor_matrix, set_spray_head_position
+from spray_cooling.physics.thermal_steps import make_flat_plate_step
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -165,6 +166,21 @@ rot = jnp.array([1.0, 0.0, 0.0, 0.0])                # 180° about x -> point -Z
 pose_positions = jnp.array(np.array(waypoints))
 pose_rotations = jnp.tile(rot, (n_waypoints, 1))
 
+
+compute_h_for_pose = make_compute_h_for_pose(
+    a=a,
+    face_normals=face_normals,
+    face_v0=face_v0,
+    face_v1=face_v1,
+    face_v2=face_v2,
+    fov=fov,
+    h_ambient=h_ambient,
+    h_spray_scale=h_spray_scale,
+    n_faces=n_faces,
+    ref_dist=ref_dist,
+    resolution=resolution,
+    sigma=sigma,
+)
 
 h_fields = jax.vmap(compute_h_for_pose)(pose_positions, pose_rotations)
 h_fields = jnp.array(h_fields)
@@ -295,28 +311,21 @@ print(f"  conductance: min={positive_G.min():.3e}, max={positive_G.max():.3e}")
 #JAX heat step + rollout
 T_init = jnp.full((n_faces,), T_initial)
 
-@jax.jit
-def step(carry, _):
-    T, step_idx = carry
-    pose_idx = jnp.minimum(step_idx // steps_per_move, n_waypoints - 1)
-    h_field  = h_fields[pose_idx]
+step = jax.jit(
+make_flat_plate_step(
+    h_fields=h_fields,
+    steps_per_move=steps_per_move,
+    n_waypoints=n_waypoints,
+    neighbors=neighbors_jax,
+    conductance=conductance_jax,
+    thermal_mass=thermal_mass_jax,
+    volumetric_heat_capacity=rho_c,
+    thickness_m=PLATE_THICKNESS,
+    ambient_temperature_c=T_ambient,
+    dt_s=dt_sim,
+)
+)
 
-    safe_neighbors = jnp.where(neighbors_jax >= 0, neighbors_jax, 0)
-    T_neighbors = T[safe_neighbors]
-    valid = (neighbors_jax >= 0).astype(jnp.float32)
-
-    conductive_power = jnp.sum(
-        conductance_jax * valid * (T_neighbors - T[:, None]),
-        axis=1
-    )
-
-    dTdt_conduction = conductive_power / thermal_mass_jax
-    dTdt_spray = -(h_field / (rho_c * PLATE_THICKNESS)) * (T - T_ambient)
-
-    T_new = T + (dTdt_conduction + dTdt_spray) * dt_sim
-    T_new = jnp.maximum(T_new, T_ambient)
-
-    return (T_new, step_idx + 1), (T_new, pose_idx)
 
 print("Running simulation...")
 _, (T_history, pose_idx_history) = jax.lax.scan(

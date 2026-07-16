@@ -11,7 +11,6 @@ def world_to_base(pos_world):
 
 def set_initial_joint(_last_joint_state, chain, name, value):
     """Set initial joint value by joint name, not by fragile hardcoded index."""
-    global _last_joint_state
     for idx, link in enumerate(chain.links):
         if link.name == name:
             _last_joint_state[idx] = value

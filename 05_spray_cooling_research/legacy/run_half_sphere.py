@@ -45,10 +45,11 @@ from spray_cooling.planning.hemisphere import (
 
 from spray_cooling.geometry.surface_mesh import load_surface_mesh
 from spray_cooling.robotics.trajectory import smooth_joint_path, unwrap_to_reference
-from spray_cooling.spray.pulse_model import compute_h_for_pose
+from spray_cooling.spray.pulse_model import make_compute_h_for_pose
 from spray_cooling.geometry.queries import nearest_surface_point_and_normal, resolve_mesh_path
 from spray_cooling.robotics.runtime import world_to_base, set_initial_joint, q_to_cfg, get_tool0_transform_world, get_tool0_world, get_nozzle_tip_world, get_nozzle_direction_world
 from spray_cooling.visualization.common import set_actor_matrix, set_spray_head_position
+from spray_cooling.physics.thermal_steps import make_conservative_thin_shell_step
 import hashlib
 from scipy.spatial.transform import Rotation as SciRotation
 
@@ -1317,6 +1318,21 @@ if os.path.isfile(_spray_cache_path):
             "spray distributions."
         )
 
+compute_h_for_pose = make_compute_h_for_pose(
+    a=a,
+    face_normals=face_normals,
+    face_v0=face_v0,
+    face_v1=face_v1,
+    face_v2=face_v2,
+    fov=fov,
+    h_ambient=h_ambient,
+    h_spray_scale=h_spray_scale,
+    n_faces=n_faces,
+    ref_dist=ref_dist,
+    resolution=resolution,
+    sigma=sigma,
+)
+
 if h_fields is None:
     h_fields = jax.vmap(
         compute_h_for_pose
@@ -1851,87 +1867,22 @@ T_init = jnp.full(
 )
 
 
-@jax.jit
-def step(carry, _):
-    """
-    Advance one recorded simulation interval.
+step = jax.jit(
+make_conservative_thin_shell_step(
+    h_fields=h_fields,
+    steps_per_move=steps_per_move,
+    n_waypoints=n_waypoints,
+    edge_i=edge_i_jax,
+    edge_j=edge_j_jax,
+    edge_conductance=edge_conductance_jax,
+    face_area=face_area_jax,
+    thermal_capacity=thermal_capacity_jax,
+    ambient_temperature_c=T_ambient,
+    thermal_substeps=THERMAL_SUBSTEPS,
+    thermal_substep_dt=THERMAL_SUBSTEP_DT,
+)
+)
 
-    The spray pose remains fixed during the internal thermal substeps.
-    """
-    temperature, step_index = carry
-
-    pose_index = jnp.minimum(
-        step_index // steps_per_move,
-        n_waypoints - 1,
-    )
-
-    h_field = h_fields[pose_index]
-
-    def thermal_substep(_, temperature_sub):
-        # Positive edge power flows from face j into face i.
-        edge_temperature_difference = (
-            temperature_sub[edge_j_jax]
-            - temperature_sub[edge_i_jax]
-        )
-
-        edge_power = (
-            edge_conductance_jax
-            * edge_temperature_difference
-        )
-
-        conductive_power = jnp.zeros_like(
-            temperature_sub
-        )
-
-        conductive_power = conductive_power.at[
-            edge_i_jax
-        ].add(
-            edge_power
-        )
-
-        conductive_power = conductive_power.at[
-            edge_j_jax
-        ].add(
-            -edge_power
-        )
-
-        convective_power = (
-            h_field
-            * face_area_jax
-            * (
-                temperature_sub
-                - T_ambient
-            )
-        )
-
-        net_power = (
-            conductive_power
-            - convective_power
-        )
-
-        temperature_next = (
-            temperature_sub
-            + THERMAL_SUBSTEP_DT
-            * net_power
-            / thermal_capacity_jax
-        )
-
-        return temperature_next
-
-    temperature_new = jax.lax.fori_loop(
-        0,
-        THERMAL_SUBSTEPS,
-        thermal_substep,
-        temperature,
-    )
-
-    return (
-        temperature_new,
-        step_index + 1,
-    ), (
-        temperature_new,
-        pose_index,
-    )
 
 
 print("Running conservative thin-shell simulation...")
@@ -2279,6 +2230,33 @@ if abs(regional_energy_closure_error) > 1.0e-5:
 
 print("PASS: dome/base energy accounting closes.")
 print("=" * 76 + "\n")
+
+
+print("Loading UR5e URDF...")
+urdf = load_robot_description(cfg.robot.description)
+
+urdf_file = os.path.join(
+    RUNTIME_DIR,
+    "_ur5e_expanded.urdf",
+)
+
+urdf.write_xml_file(urdf_file)
+
+chain = Chain.from_urdf_file(
+    urdf_file,
+    base_elements=["base_link"],
+    active_links_mask=[
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        False,
+    ],
+)
 
 
 # BOUNDED UR5E IK SAFETY
