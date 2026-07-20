@@ -17,8 +17,8 @@ Physics:
 #
 # ALWAYS stop this program from the terminal with Ctrl+C.
 # DO NOT close the PyVista window with the X button.
+import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 #
-
 import os
 import time
 from collections import defaultdict

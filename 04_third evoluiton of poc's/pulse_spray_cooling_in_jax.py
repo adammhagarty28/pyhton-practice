@@ -25,14 +25,14 @@ nx, ny       = 40, 40
 T_initial    = 900.0
 T_ambient    = 25.0
 h_spray      = 0.15
-h_ambient    = 0.005
-alpha        = 0.01
+h_ambient    = 0.0005
+alpha        = 10
 spray_radius = 16
 dt           = 0.5
 
 #spray timing
 t_on         = 5.0    #seconds spray is ON
-t_off        = 5.0    #seconds spray is OFF
+t_off        = 50.0    #seconds spray is OFF
 t_end        = 60.0   #total simulation time
 steps        = int(t_end / dt)
 
@@ -47,16 +47,14 @@ yy_np, xx_np = np.meshgrid(np.arange(ny), np.arange(nx), indexing='ij')
 dist = np.sqrt((xx_np - cx)**2 + (yy_np - cy)**2)
 sigma_spray = spray_radius / 2.0
 spray_mask_np = np.exp(-dist**2 / (2 * sigma_spray**2)).astype(np.float32)
-spray_mask_jax = jnp.array(spray_mask_np)
+spray_on_mask = jnp.array(spray_mask_np)
+spray_off_mask = jnp.zeros_like(spray_on_mask,shape=spray_on_mask.shape).astype(jnp.float32)
 
 #spray schedule: precompute which steps have spray ON
 #spray is ON during [0, t_on], OFF during [t_on, t_on+t_off], repeat
 cycle = t_on + t_off
-spray_on_schedule = np.array([
-    (t % cycle) < t_on
-    for t in np.arange(steps) * dt
-], dtype=np.float32)
-spray_on_jax = jnp.array(spray_on_schedule)
+spray_on_schedule = jnp.array(np.array([(t % cycle) < t_on for t in np.arange(steps) * dt], dtype=np.float32))
+
 
 #JAX step function
 @jax.jit
@@ -64,7 +62,9 @@ def step(carry, spray_on):
     T, step_idx = carry
 
     #h_field depends on whether spray is on this timestep
-    h_field = h_ambient + spray_mask_jax * h_spray * spray_on
+    mask=spray_on_mask * spray_on
+    h_field = h_ambient + mask * h_spray * spray_on
+    jax.debug.print("h_field sum={h_sum}", h_sum=h_field.sum())
 
     #laplacian
     d2Tdx2 = jnp.zeros_like(T)
@@ -85,11 +85,10 @@ def step(carry, spray_on):
 #run simulation
 print("Running simulation...")
 _, (T_history, spray_schedule_out) = jax.lax.scan(
-    step, (T_init, jnp.int32(0)), spray_on_jax
+    step, (T_init, jnp.int32(0)), spray_on_schedule
 )
-T_history          = np.array(T_history)
+T_history = np.array(T_history)
 spray_schedule_out = np.array(spray_schedule_out)
-print("Done.")
 
 #animation + interactive clicking
 clicked_points = []
@@ -154,7 +153,7 @@ fig.canvas.mpl_connect('button_press_event', on_click)
 ani = animation.FuncAnimation(
     fig, animate,
     frames=range(0, steps // skip),
-    interval=30,
+    interval=60,
     blit=False
 )
 

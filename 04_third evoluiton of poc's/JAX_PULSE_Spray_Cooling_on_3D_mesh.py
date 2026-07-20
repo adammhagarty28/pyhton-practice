@@ -68,9 +68,9 @@ print(f"Mesh bounds: x [{float(face_v0[:,0].min()):.2f}, {float(face_v0[:,0].max
 print(f"             y [{float(face_v0[:,1].min()):.2f}, {float(face_v0[:,1].max()):.2f}]")
 
 #zigzag nozzle path
-z_height = 1.5
-x_range  = np.linspace(0.1, 2.9, 20)
-y_range  = np.linspace(0.1, 2.9, 20)
+z_height = .5
+x_range  = np.linspace(0.1, 2.9, 40)
+y_range  = np.linspace(0.1, 2.9, 40)
 
 poses = []
 for i, y in enumerate(y_range):
@@ -88,7 +88,7 @@ pose_rotations = jnp.stack([p.rotation for p in poses])
 steps_per_move = max(1, steps // n_poses)
 
 #precompute h_local for each pose
-int("Precomputing spray distributions...")
+print("Precomputing spray distributions...")
 
 def compute_h_for_pose(pos, rot):
     weight = deposit(
