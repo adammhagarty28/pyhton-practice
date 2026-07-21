@@ -56,30 +56,21 @@ os.makedirs(RUNTIME_DIR, exist_ok=True)
 cfg = load_config(CONFIG_PATH, project_root=PROJECT_ROOT)
 
 
-#parameters
-T_initial     = cfg.thermal.initial_temperature_c
-k             = cfg.thermal.thermal_conductivity_w_mk
-T_ambient     = cfg.thermal.ambient_temperature_c
-
-# PHYSICS CHANGE:
-# OLD:
-#   h_spray_scale = 200000.0 was used with the old graph-Laplacian sink:
-#       dTdt = alpha*laplacian - (h/rho_c)*(T - T_ambient)
-#
-# NEW:
-#   h_spray_scale is now treated as a surface convection coefficient [W/m^2-K].
-#   The new heat equation divides cooling by rho*c*PLATE_THICKNESS:
-#       dTdt_spray = -h*(T - T_ambient)/(rho*c*PLATE_THICKNESS)
-#
-# Starting with 2000 W/m^2-K keeps the cooling aggressive but more defensible
-# than the previous dimensionally inconsistent 200000 value.
-h_spray_scale = cfg.thermal.spray_h_scale_w_m2k
-
-h_ambient     = cfg.thermal.ambient_h_w_m2k
-c             = cfg.thermal.specific_heat_j_kgk
-rho           = cfg.thermal.density_kg_m3
-rho_c         = rho * c
-alpha         = k / rho_c
+# Physics parameters (POC 3 volume-mesh + IMEX + boiling curve)
+T_initial   = cfg.thermal.initial_temperature_c        # [C]
+T_ambient   = cfg.thermal.ambient_temperature_c        # [C]
+rho         = cfg.thermal.density_kg_m3                # [kg/m^3]
+h_ambient   = cfg.thermal.ambient_h_w_m2k              # [W/(m^2 K)]
+PLATE_THICKNESS   = cfg.thermal.thickness_m            # [m]
+LAYER_THICKS_NP   = np.array(cfg.thermal.layer_thicknesses_m)   # [m], top->bottom
+N_LAYERS          = cfg.thermal.n_layers               # [-]
+# Legacy fallback constants for pre-JAX printouts and any legacy calls
+k           = cfg.thermal.thermal_conductivity_w_mk
+c           = cfg.thermal.specific_heat_j_kgk
+rho_c       = rho * c
+alpha       = k / rho_c
+# Boiling curve + radiation
+STEFAN_BOLTZMANN = cfg.radiation.stefan_boltzmann_w_m2k4   # [W/(m^2 K^4)]
 
 dt_sim        = cfg.simulation.dt_s
 t_end         = cfg.simulation.end_time_s
@@ -96,7 +87,6 @@ fov           = cfg.spray.field_of_view_deg
 PLATE_SIZE   = cfg.geometry.plate_size_m
 PLATE_CENTER = np.array(cfg.geometry.plate_center_m, dtype=float)
 PLATE_Z      = float(PLATE_CENTER[2])
-PLATE_THICKNESS = cfg.thermal.thickness_m
 ROBOT_BASE   = np.array(cfg.robot.base_position_m, dtype=float)
 NOZZLE_Z     = cfg.path.nozzle_world_z_m
 NOZZLE_LENGTH = cfg.robot.visual_nozzle_length_m
@@ -159,187 +149,243 @@ steps_per_move = max(1, steps // n_waypoints)
 print(f"Total waypoints: {n_waypoints}")
 
 
-#precompute h_fields — nozzle points straight down
-print("Precomputing spray distributions...")
-rot = jnp.array([1.0, 0.0, 0.0, 0.0])                # 180° about x -> point -Z
-
+#precompute normalized PULSE spray masks (per-pose, per-surface-triangle)
+print("Precomputing PULSE spray masks...")
+rot = jnp.array([1.0, 0.0, 0.0, 0.0])   # nozzle points -Z
 pose_positions = jnp.array(np.array(waypoints))
 pose_rotations = jnp.tile(rot, (n_waypoints, 1))
 
-
-compute_h_for_pose = make_compute_h_for_pose(
-    a=a,
-    face_normals=face_normals,
-    face_v0=face_v0,
-    face_v1=face_v1,
-    face_v2=face_v2,
-    fov=fov,
-    h_ambient=h_ambient,
-    h_spray_scale=h_spray_scale,
-    n_faces=n_faces,
-    ref_dist=ref_dist,
-    resolution=resolution,
-    sigma=sigma,
-)
-
-h_fields = jax.vmap(compute_h_for_pose)(pose_positions, pose_rotations)
-h_fields = jnp.array(h_fields)
-print("Done precomputing.")
+def _compute_weight_for_pose(pos, rot_):
+    return deposit(
+        pos, rot_, sigma, a, ref_dist, resolution,
+        face_v0, face_v1, face_v2, face_normals, n_faces, fov,
+    )
+weights_raw   = jax.vmap(_compute_weight_for_pose)(pose_positions, pose_rotations)
+peak_weight   = jnp.max(weights_raw)
+if float(peak_weight) < 1e-12:
+    raise RuntimeError("PULSE returned zero weights - check nozzle Z, sigma, ref_dist, fov")
+spray_masks_surf = jnp.array(weights_raw / peak_weight)   # [n_poses, n_faces] in [0,1]
+print(f"  PULSE peak weight (raw): {float(peak_weight):.4f} -> normalized to 1.0")
+print(f"  active poses (any spray hit): {int(jnp.sum(jnp.max(spray_masks_surf, axis=1) > 0.01))} / {n_waypoints}")
 
 
 
-#geometry-weighted thermal operator
-print("Building geometry-weighted thermal operator...")
+# Volume mesh construction (POC 3): prism extrusion of surface triangles
+print("Building 3D volume mesh (prism extrusion)...")
 
-# PHYSICS CHANGE:
-# OLD:
-#   We previously used a graph Laplacian:
-#       laplacian = mean_neighbor_temperature - T
-#       dTdt = alpha*laplacian - (h/rho_c)*(T - T_ambient)
-#
-#   That was useful for a POC, but it ignored triangle area, shared-edge length,
-#   centroid spacing, plate thickness, and face thermal mass.
-#
-# NEW:
-#   We now use a finite-volume / FEM-style thermal surface operator:
-#       thermal_mass_i = rho*c*thickness*area_i
-#       G_ij = k*thickness*shared_edge_length / center_distance
-#       dTdt_cond_i = sum_j G_ij*(T_j - T_i) / thermal_mass_i
-#
-#   Spray cooling is now treated as a surface Neumann convection sink:
-#       dTdt_spray_i = -h_i*(T_i - T_ambient)/(rho*c*thickness)
-#
-#   This is the thermal-only piece we actually need from Josh's FEM direction:
-#   transient heat storage + geometry-aware conduction + surface convection.
-
-
-# RESULT COMPARISON:
-# OLD GRAPH-LAPLACIAN PHYSICS TERMINAL RESULT:
-#   Building face adjacency...
-#   Adjacency built.
-#
-#   Final results:
-#     Peak temp:     308.2 C
-#     Min temp:       37.4 C
-#     Temp spread:   270.8 C
-#     Avg temp:       68.5 C
-#
-# NEW GEOMETRY-WEIGHTED THERMAL OPERATOR RESULT:
-#   Building geometry-weighted thermal operator...
-#   Geometry-weighted thermal operator built.
-#     face area: min=9.766e-06, max=9.766e-06
-#     conductance: min=7.500e-01, max=1.500e+00
-#
-#   Final results:
-#     Peak temp:      94.1 C
-#     Min temp:       50.5 C
-#     Temp spread:    43.5 C
-#     Avg temp:       71.3 C
-#
-# INTERPRETATION:
-#   The average temperature stayed in the same general range, but the peak
-#   temperature and spread dropped dramatically. This means the new operator is
-#   not simply "overcooling" the whole plate. Instead, it is redistributing heat
-#   through geometry-aware conduction so corners and boundary regions no longer
-#   remain unrealistically hot.
-#
-#   Old model: useful POC, but graph-based and dimensionally weak.
-#   New model: thermal-only FEM-style bridge using thermal mass, conductance,
-#   plate thickness, and surface convection from the robotic spray field.
-
-mesh_pv = surface_mesh.polydata
-points_np = surface_mesh.points
-faces_np = surface_mesh.faces
-
+mesh_pv       = surface_mesh.polydata
+points_np     = surface_mesh.points
+faces_np      = surface_mesh.faces
+n_surface     = pulse_model.n_faces
 fv_face_centers_np = surface_mesh.face_centers
-fv_face_area_np = surface_mesh.face_areas
+fv_face_area_np    = surface_mesh.face_areas
+areas_surf_np      = np.array(fv_face_area_np)
 
+n_cells = n_surface * N_LAYERS
+print(f"  n_surface={n_surface}, N_LAYERS={N_LAYERS}, n_cells={n_cells}")
+
+# Per-cell volumes and layer index
+cell_volume_np = np.zeros(n_cells, dtype=np.float64)
+cell_layer_np  = np.zeros(n_cells, dtype=np.int32)
+for layer in range(N_LAYERS):
+    cell_volume_np[layer*n_surface:(layer+1)*n_surface] = areas_surf_np * LAYER_THICKS_NP[layer]
+    cell_layer_np[layer*n_surface:(layer+1)*n_surface]  = layer
+
+is_top_np    = (cell_layer_np == 0).astype(np.float64)
+is_bottom_np = (cell_layer_np == N_LAYERS - 1).astype(np.float64)
+face_area_top_np    = np.where(cell_layer_np == 0,            np.tile(areas_surf_np, N_LAYERS), 0.0)
+face_area_bottom_np = np.where(cell_layer_np == N_LAYERS - 1, np.tile(areas_surf_np, N_LAYERS), 0.0)
+
+# In-layer (surface) adjacency + edge lengths (needed for lateral connectivity)
 edge_to_faces = defaultdict(list)
-edge_to_length = {}
-
+edge_length   = {}
 for fi, face in enumerate(faces_np):
     for j in range(3):
-        a_idx = face[j]
-        b_idx = face[(j + 1) % 3]
-        edge = tuple(sorted([a_idx, b_idx]))
+        v0, v1 = face[j], face[(j + 1) % 3]
+        edge = tuple(sorted([v0, v1]))
         edge_to_faces[edge].append(fi)
+        if edge not in edge_length:
+            edge_length[edge] = float(np.linalg.norm(points_np[v0] - points_np[v1]))
 
-        pa = points_np[a_idx]
-        pb = points_np[b_idx]
-        edge_to_length[edge] = np.linalg.norm(pb - pa)
+MAX_LATERAL = 3
+lateral_nb_surf  = -1 * np.ones((n_surface, MAX_LATERAL), dtype=np.int32)
+lateral_edge_len = np.zeros((n_surface, MAX_LATERAL), dtype=np.float64)
+for fi, face in enumerate(faces_np):
+    slot = 0
+    for j in range(3):
+        edge = tuple(sorted([face[j], face[(j + 1) % 3]]))
+        for fj in edge_to_faces[edge]:
+            if fj != fi and slot < MAX_LATERAL:
+                lateral_nb_surf[fi, slot]  = fj
+                lateral_edge_len[fi, slot] = edge_length[edge]
+                slot += 1
 
-max_neighbors = 3
-neighbors = -1 * np.ones((n_faces, max_neighbors), dtype=np.int32)
-conductance = np.zeros((n_faces, max_neighbors), dtype=np.float32)
+# Side-face area per cell: exposed (boundary) edge total length * layer thickness
+face_area_side_np = np.zeros(n_cells, dtype=np.float64)
+for fi in range(n_surface):
+    exposed_len = 0.0
+    for j in range(3):
+        edge = tuple(sorted([faces_np[fi, j], faces_np[fi, (j + 1) % 3]]))
+        if len(edge_to_faces[edge]) == 1:
+            exposed_len += edge_length[edge]
+    for layer in range(N_LAYERS):
+        face_area_side_np[layer*n_surface + fi] = exposed_len * LAYER_THICKS_NP[layer]
 
-for edge, fs in edge_to_faces.items():
-    if len(fs) != 2:
-        # Boundary edge: no neighbor across this edge.
-        # Boundary/surface cooling is handled through h_field below.
-        continue
+# Full 3D adjacency + G_ij = A_ij / (d_ij V_i)  [1/m^2]
+MAX_NB_3D = 5   # 3 lateral + 2 vertical
+neighbors_3d_np = -1 * np.ones((n_cells, MAX_NB_3D), dtype=np.int32)
+G_matrix_np     = np.zeros((n_cells, MAX_NB_3D), dtype=np.float64)
 
-    f0, f1 = fs
-    edge_len = edge_to_length[edge]
+for layer in range(N_LAYERS):
+    L_i = LAYER_THICKS_NP[layer]
+    for si in range(n_surface):
+        ci  = layer * n_surface + si
+        V_i = areas_surf_np[si] * L_i
+        slot = 0
+        # Lateral (in-layer)
+        for kk in range(MAX_LATERAL):
+            nb_s = lateral_nb_surf[si, kk]
+            if nb_s >= 0:
+                edge_len = lateral_edge_len[si, kk]
+                A_ij = edge_len * L_i
+                d_ij = float(np.linalg.norm(fv_face_centers_np[si] - fv_face_centers_np[nb_s]))
+                d_ij = max(d_ij, 1e-9)
+                neighbors_3d_np[ci, slot] = layer * n_surface + nb_s
+                G_matrix_np[ci, slot]     = A_ij / (d_ij * V_i)
+                slot += 1
+        # Up neighbor
+        if layer > 0:
+            L_up = LAYER_THICKS_NP[layer - 1]
+            A_ij = areas_surf_np[si]
+            d_ij = 0.5 * (L_i + L_up)
+            neighbors_3d_np[ci, slot] = (layer - 1) * n_surface + si
+            G_matrix_np[ci, slot]     = A_ij / (d_ij * V_i)
+            slot += 1
+        # Down neighbor
+        if layer < N_LAYERS - 1:
+            L_dn = LAYER_THICKS_NP[layer + 1]
+            A_ij = areas_surf_np[si]
+            d_ij = 0.5 * (L_i + L_dn)
+            neighbors_3d_np[ci, slot] = (layer + 1) * n_surface + si
+            G_matrix_np[ci, slot]     = A_ij / (d_ij * V_i)
+            slot += 1
 
-    c0 = fv_face_centers_np[f0]
-    c1 = fv_face_centers_np[f1]
-    center_dist = max(np.linalg.norm(c1 - c0), 1e-12)
+positive_G = G_matrix_np[G_matrix_np > 0]
+print(f"  volume adjacency built. G stats: min={positive_G.min():.3e}, max={positive_G.max():.3e} [1/m^2]")
 
-    # Conductance between neighboring triangular control volumes.
-    G = k * PLATE_THICKNESS * edge_len / center_dist
-
-    for a_face, b_face in [(f0, f1), (f1, f0)]:
-        open_slots = np.where(neighbors[a_face] < 0)[0]
-        if len(open_slots) == 0:
-            continue
-
-        slot = open_slots[0]
-        neighbors[a_face, slot] = b_face
-        conductance[a_face, slot] = G
-
-neighbors_jax = jnp.array(neighbors)
-conductance_jax = jnp.array(conductance)
-face_area_jax = jnp.array(fv_face_area_np)
-thermal_mass_jax = rho_c * PLATE_THICKNESS * face_area_jax
-
-positive_G = conductance[conductance > 0]
-print("Geometry-weighted thermal operator built.")
-print(f"  face area: min={fv_face_area_np.min():.3e}, max={fv_face_area_np.max():.3e}")
-print(f"  conductance: min={positive_G.min():.3e}, max={positive_G.max():.3e}")
+# JAX arrays for step function
+neighbors_3d_jax  = jnp.array(neighbors_3d_np)
+G_matrix_jax      = jnp.array(G_matrix_np)
+cell_volume_jax   = jnp.array(cell_volume_np)
+face_area_top_jax    = jnp.array(face_area_top_np)
+face_area_bottom_jax = jnp.array(face_area_bottom_np)
+face_area_side_jax   = jnp.array(face_area_side_np)
+is_top_mask_jax      = jnp.array(is_top_np)
+surface_areas_jax    = jnp.array(areas_surf_np)
 
 
-#JAX heat step + rollout
-T_init = jnp.full((n_faces,), T_initial)
+# JAX step + rollout (POC 3 IMEX BE with volume mesh + boiling curve + radiation)
+T_init_K = jnp.full((n_cells,), T_initial + 273.15)
 
-step = jax.jit(
-make_flat_plate_step(
-    h_fields=h_fields,
+steps = int(cfg.simulation.end_time_s / cfg.simulation.dt_s)
+steps_per_move = max(1, steps // n_waypoints)
+
+step = jax.jit(make_flat_plate_step(
+    spray_masks_surf=spray_masks_surf,
     steps_per_move=steps_per_move,
     n_waypoints=n_waypoints,
-    neighbors=neighbors_jax,
-    conductance=conductance_jax,
-    thermal_mass=thermal_mass_jax,
-    volumetric_heat_capacity=rho_c,
-    thickness_m=PLATE_THICKNESS,
+    n_surface=n_surface,
+    n_cells=n_cells,
+    neighbors_3d=neighbors_3d_jax,
+    G_matrix=G_matrix_jax,
+    cell_volume=cell_volume_jax,
+    face_area_top=face_area_top_jax,
+    face_area_bottom=face_area_bottom_jax,
+    face_area_side=face_area_side_jax,
+    is_top_mask=is_top_mask_jax,
+    surface_areas=surface_areas_jax,
+    temp_table_k=cfg.thermal.temp_table_k,
+    k_table_w_mk=cfg.thermal.k_table_w_mk,
+    cp_table_j_kgk=cfg.thermal.cp_table_j_kgk,
+    emissivity_table=cfg.thermal.emissivity_table,
+    density_kg_m3=rho,
+    stefan_boltzmann=STEFAN_BOLTZMANN,
+    h_ambient_w_m2k=h_ambient,
+    boiling_temp_table_c=cfg.spray.boiling_temp_table_c,
+    boiling_h_table_w_m2k=cfg.spray.boiling_h_table_w_m2k,
     ambient_temperature_c=T_ambient,
-    dt_s=dt_sim,
-)
-)
+    dt_s=cfg.simulation.dt_s,
+    delta_off_fraction=cfg.control.delta_off_fraction,
+    delta_on_fraction=cfg.control.delta_on_fraction,
+    spray_ramp_tau_s=cfg.control.spray_ramp_tau_s,
+))
 
-
-print("Running simulation...")
-_, (T_history, pose_idx_history) = jax.lax.scan(
-    step, (T_init, jnp.int32(0)), None, length=steps
-)
-T_history        = np.array(T_history)
-pose_idx_history = np.array(pose_idx_history)
+print("Running IMEX backward-Euler simulation on volume mesh...")
+init_carry = (T_init_K, jnp.int32(0), jnp.float64(1.0), jnp.float64(1.0), jnp.float64(1.0))
+_, (T_history_C_full, pose_idx_history, spray_history, T_top_history_C, T_bot_history_C) = \
+    jax.lax.scan(step, init_carry, None, length=steps)
+T_history_C_full  = np.array(T_history_C_full)          # [steps, n_cells] full 3D history
+pose_idx_history  = np.array(pose_idx_history)
+spray_history_np  = np.array(spray_history)
+T_top_history_C   = np.array(T_top_history_C)           # [steps, n_surface]
+T_bot_history_C   = np.array(T_bot_history_C)           # [steps, n_surface]
+# For click-history compatibility, expose top-layer as the default 'T_history'
+T_history = T_top_history_C
 print("Done.")
 
-print(f"\nFinal results:")
-print(f"  Peak temp:    {T_history[-1].max():.1f} C")
-print(f"  Min temp:     {T_history[-1].min():.1f} C")
-print(f"  Temp spread:  {T_history[-1].max() - T_history[-1].min():.1f} C")
-print(f"  Avg temp:     {T_history[-1].mean():.1f} C")
+# Volume-weighted plate average per step
+vol_np_arr  = cell_volume_np
+plate_avg_C = (T_history_C_full * vol_np_arr[None, :]).sum(axis=1) / vol_np_arr.sum()
+final_top   = T_top_history_C[-1]
+final_bot   = T_bot_history_C[-1]
+peak_grad   = np.max(T_bot_history_C.mean(axis=1) - T_top_history_C.mean(axis=1))
+peak_grad_t = float(np.argmax(T_bot_history_C.mean(axis=1) - T_top_history_C.mean(axis=1))) * cfg.simulation.dt_s
+n_on  = int(np.sum(spray_history_np > 0.5))
+n_off = int(np.sum(spray_history_np <= 0.5))
+transitions = int(np.sum(np.abs(np.diff((spray_history_np > 0.5).astype(np.int32)))))
+
+print("\n" + "="*70)
+print("FINAL RESULTS (POC 3 volume mesh + IMEX + boiling curve)")
+print("="*70)
+
+# Build volumetric UnstructuredGrid for 3D visualization (POC 3)
+print("Building 3D volume mesh for visualization...")
+# Extrude surface points downward through N_LAYERS layers.
+z_offsets = np.zeros(N_LAYERS + 1, dtype=np.float64)
+for i in range(N_LAYERS):
+    z_offsets[i + 1] = z_offsets[i] - LAYER_THICKS_NP[i]
+
+n_verts_surf = len(points_np)
+verts_3d = np.zeros((n_verts_surf * (N_LAYERS + 1), 3), dtype=np.float64)
+for lvl in range(N_LAYERS + 1):
+    verts_3d[lvl * n_verts_surf:(lvl + 1) * n_verts_surf, 0:2] = points_np[:, 0:2]
+    verts_3d[lvl * n_verts_surf:(lvl + 1) * n_verts_surf, 2]   = points_np[:, 2] + z_offsets[lvl]
+
+# VTK_WEDGE (=13) cells: 6 vertices per prism.
+cells_vtk = []
+for layer in range(N_LAYERS):
+    for si in range(n_surface):
+        top_v = faces_np[si] + layer * n_verts_surf
+        bot_v = faces_np[si] + (layer + 1) * n_verts_surf
+        cells_vtk.extend([6, top_v[0], top_v[1], top_v[2], bot_v[0], bot_v[1], bot_v[2]])
+cells_vtk = np.array(cells_vtk, dtype=np.int64)
+cell_types = np.full(n_cells, 13, dtype=np.uint8)
+vol_grid_pv = pv.UnstructuredGrid(cells_vtk, cell_types, verts_3d)
+vol_grid_pv.cell_data['temperature'] = T_history_C_full[0]
+print(f"  volumetric grid built: {n_cells} wedge cells")
+
+print(f"  Initial avg temp:      {T_initial:.1f} C")
+print(f"  Final avg temp:        {plate_avg_C[-1]:.1f} C   (delta {T_initial - plate_avg_C[-1]:.1f} C)")
+print(f"  Final top peak:        {final_top.max():.1f} C")
+print(f"  Final top min:         {final_top.min():.1f} C")
+print(f"  Final top spread:      {final_top.max() - final_top.min():.1f} C")
+print(f"  Top layer  final:  avg {final_top.mean():.1f} C   min {final_top.min():.1f} C   max {final_top.max():.1f} C")
+print(f"  Bottom layer final: avg {final_bot.mean():.1f} C  min {final_bot.min():.1f} C  max {final_bot.max():.1f} C")
+print(f"  Peak through-thickness gradient during sim: {peak_grad:.1f} C  (at t = {peak_grad_t:.1f} s)")
+print(f"  Spray ON steps:  {n_on}  ({100*n_on/steps:.1f}%)")
+print(f"  Spray OFF steps: {n_off} ({100*n_off/steps:.1f}%)")
+print(f"  Spray on/off transitions: {transitions}")
+print("="*70)
 
 
 #UR5e URDF load + ikpy chain
@@ -602,8 +648,9 @@ print("PYVISTA SHUTDOWN: return to the terminal and press Ctrl+C.")
 print("DO NOT close the PyVista window with its X button.")
 print("=" * 72)
 
-mesh_vis = pv.read(tmp_mesh_path).triangulate()
-mesh_vis.cell_data['temperature'] = T_history[0]
+# Volumetric grid replaces flat surface for POC 3 rendering
+mesh_vis = vol_grid_pv
+mesh_vis.cell_data['temperature'] = T_history_C_full[0]
 
 plotter = pv.Plotter(shape=(1, 2), window_size=(1800, 900))
 # INTERACTIVE TEMPERATURE HISTORY VIEW:
@@ -754,10 +801,11 @@ ground = pv.Plane(center=(0.4, 0, -0.155), direction=(0, 0, 1), i_size=2.0, j_si
 ground_actor = plotter.add_mesh(ground, color='#151515', show_edges=False)
 ground_actor.SetPickable(False)
 
-# plate heatmap
+# plate heatmap - volumetric with mesh edges visible
 heatmap_actor = plotter.add_mesh(
     mesh_vis, scalars='temperature', cmap='inferno',
-    show_edges=False, clim=[T_ambient, T_initial],
+    show_edges=True, edge_color='#101010', line_width=0.3,
+    clim=[T_ambient, T_initial],
     scalar_bar_args={
         'title': 'Temperature (°C)',
         'color': 'white',
@@ -1147,9 +1195,10 @@ while True:
         target = visual_targets[j]
         q = q_anim_path[j]
 
-        # plate temperature still comes from precomputed thermal simulation
-        mesh_vis.cell_data['temperature'] = T_history[frame]
-        heatmap_actor.mapper.dataset.cell_data['temperature'] = T_history[frame]
+        # plate temperature: full 3D volume, all cells updated
+        full_T_frame = T_history_C_full[frame]
+        mesh_vis.cell_data['temperature'] = full_T_frame
+        heatmap_actor.mapper.dataset.cell_data['temperature'] = full_T_frame
         heatmap_actor.mapper.dataset.Modified()
 
         # UR5e pose update from cached joint path
