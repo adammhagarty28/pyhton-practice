@@ -37,11 +37,11 @@ boiling_temp_table_c   = [  25.0,  100.0,  200.0,  300.0,  400.0,  500.0,  900.0
 boiling_h_table_w_m2k  = [3000.0, 3000.0,30000.0,40000.0,15000.0, 3000.0, 2000.0]  # [W/(m^2 K)]
 
 [control]
-# Adaptive hysteresis: spray OFF/ON relative to (T_plate_avg - T_ambient)
-delta_off_fraction = 0.30   # [-] OFF when zone < plate_avg - frac * headroom
-delta_on_fraction  = 0.10   # [-] ON  when zone > plate_avg - frac * headroom
-# Smooth valve dynamics (two cascaded 1st-order lags -> S-curve)
-spray_ramp_tau_s   = 1.0    # [s] per-stage lag time constant
+# Hysteresis disabled for pure snake pattern (industrial reality).
+# delta_off_fraction huge -> spray zone can never satisfy the OFF condition.
+delta_off_fraction = 100.0   # [-] effectively disabled (spray never turns off)
+delta_on_fraction  = 0.001   # [-] tiny positive; must be > 0 per config validator
+spray_ramp_tau_s   = 0.05    # [s] near-instant valve (still smooth for viz)
 
 [geometry]
 mesh_path = "data/meshes/refined_plate.obj"

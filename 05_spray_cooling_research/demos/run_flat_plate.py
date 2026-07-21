@@ -19,6 +19,10 @@ Physics:
 # DO NOT close the PyVista window with the X button.
 import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 #
+# CRITICAL: enable JAX float64 BEFORE any jax operation is executed.
+# Radiation T^4 at 1173K ~= 6.5e11 needs float64 precision.
+from jax import config as _jax_config
+_jax_config.update("jax_enable_x64", True)
 import os
 import time
 from collections import defaultdict
@@ -372,6 +376,17 @@ cells_vtk = np.array(cells_vtk, dtype=np.int64)
 cell_types = np.full(n_cells, 13, dtype=np.uint8)
 vol_grid_pv = pv.UnstructuredGrid(cells_vtk, cell_types, verts_3d)
 vol_grid_pv.cell_data['temperature'] = T_history_C_full[0]
+
+# Compute per-cell centroids for click-anywhere picking (top, sides, bottom)
+cell_centroids_np = np.zeros((n_cells, 3), dtype=np.float64)
+for layer in range(N_LAYERS):
+    z_top    = float(np.sum(LAYER_THICKS_NP[:layer]))
+    z_bottom = float(np.sum(LAYER_THICKS_NP[:layer + 1]))
+    z_mid    = -0.5 * (z_top + z_bottom)   # negative because we extrude downward
+    for si in range(n_surface):
+        ci = layer * n_surface + si
+        cell_centroids_np[ci, 0:2] = fv_face_centers_np[si, 0:2]
+        cell_centroids_np[ci, 2]   = points_np[faces_np[si, 0], 2] + z_mid
 print(f"  volumetric grid built: {n_cells} wedge cells")
 
 print(f"  Initial avg temp:      {T_initial:.1f} C")
@@ -988,8 +1003,8 @@ plotter.camera.SetClippingRange(0.01, 10.0)
 # clickable plate temperature-history callback
 print("Enabling clickable plate temperature-history picking...")
 
-# Use face centers from the geometry-weighted thermal operator.
-plate_pick_centers = fv_face_centers_np
+# Use per-cell centroids so clicks can land on top, side, or bottom cells.
+plate_pick_centers = cell_centroids_np
 
 # Plate-only click filter.
 plate_x_min, plate_x_max = mesh_pv.bounds[0], mesh_pv.bounds[1]
@@ -1019,53 +1034,84 @@ def refresh_history_panel():
 def add_temperature_curve_from_point(p_click):
     p_click = np.array(p_click, dtype=float)
 
-    on_plate_z = abs(p_click[2] - plate_z_ref) <= plate_z_tol
+    # Broadened plate bounding box that includes the full volumetric slab
+    # (top face at plate_z_ref, bottom face PLATE_THICKNESS below).
+    z_lo = plate_z_ref - PLATE_THICKNESS - 0.020   # 20 mm slack
+    z_hi = plate_z_ref + 0.020
     inside_x = (plate_x_min - plate_xy_pad) <= p_click[0] <= (plate_x_max + plate_xy_pad)
     inside_y = (plate_y_min - plate_xy_pad) <= p_click[1] <= (plate_y_max + plate_xy_pad)
+    inside_z = z_lo <= p_click[2] <= z_hi
 
-    if not (on_plate_z and inside_x and inside_y):
+    if not (inside_x and inside_y and inside_z):
         print(
-            "Ignored click not on plate: "
+            "Ignored click not on plate volume: "
             f"x={p_click[0]:.3f}, y={p_click[1]:.3f}, z={p_click[2]:.3f}"
         )
         return
 
+    # Nearest CELL centroid (not just surface triangle center).
     dists = np.linalg.norm(plate_pick_centers - p_click[None, :], axis=1)
-    face_idx = int(np.argmin(dists))
-    center = plate_pick_centers[face_idx]
+    cell_idx = int(np.argmin(dists))
+    center = plate_pick_centers[cell_idx]
 
-    if dists[face_idx] > 0.055:
-        print(f"Ignored click too far from plate face: distance={dists[face_idx]:.3f} m")
+    if dists[cell_idx] > 0.055:
+        print(f"Ignored click too far from plate cell: distance={dists[cell_idx]:.3f} m")
         return
 
-    # skip if we already picked this exact face
-    if face_idx in picked_face_ids:
-        print(f"Face {face_idx} already plotted, skipping.")
-        return
-    
-    # skip if we already picked this exact face
-    if face_idx in picked_face_ids:
-        print(f"Face {face_idx} already plotted, skipping.")
+    if cell_idx in picked_face_ids:
+        print(f"Cell {cell_idx} already plotted, skipping.")
         return
 
-    temps = T_history[:, face_idx]
-    # Convert world-frame point to robot base frame for meaningful robotics coordinates
+    # Pull temperature history from the FULL 3D volume history, not top-only.
+    temps = T_history_C_full[:, cell_idx]
+
+    # Which layer / face-type did we click on? Helpful for the label.
+    layer_of_cell = cell_idx // n_surface
+    if layer_of_cell == 0:
+        face_label = "top"
+    elif layer_of_cell == N_LAYERS - 1:
+        face_label = "bottom"
+    else:
+        face_label = f"layer {layer_of_cell}"
+
     center_base = center - ROBOT_BASE
-    label = f"({center_base[0]*1000:.0f}, {center_base[1]*1000:.0f}, {center_base[2]*1000:.0f}) mm from base"
+    label = (f"({center_base[0]*1000:.0f}, {center_base[1]*1000:.0f}, "
+             f"{center_base[2]*1000:.0f}) mm from base [{face_label}]")
 
     history_curves.append(temps)
     history_labels.append(label)
-    picked_face_ids.append(face_idx)
+    picked_face_ids.append(cell_idx)
 
     refresh_history_panel()
 
-    # Add marker on plate.
-    plotter.subplot(0, 0)
-    marker_center = center.copy()
-    marker_center[2] = plate_z_ref + 0.006
+    # Offset marker outward from the plate so it's visible from the click side.
+    # Determine which face of the volume the cell centroid is closest to.
+    plate_top_z    = plate_z_ref
+    plate_bottom_z = plate_z_ref - PLATE_THICKNESS
+    marker_offset  = 0.010   # [m] 10 mm outside the plate
 
-    marker_sphere = pv.Sphere(radius=0.006, center=marker_center)
-    marker_actor = plotter.add_mesh(marker_sphere, name=f"picked_face_{face_idx}")
+    marker_center = center.copy()
+    if layer_of_cell == 0:
+        # Top-face cell: pop marker up into free space above the plate
+        marker_center[2] = plate_top_z + marker_offset
+    elif layer_of_cell == N_LAYERS - 1:
+        # Bottom-face cell: pop marker down below the plate
+        marker_center[2] = plate_bottom_z - marker_offset
+    else:
+        # Interior/side cell: push marker sideways along whichever XY axis
+        # points outward from plate center.
+        plate_cx = 0.5 * (plate_x_min + plate_x_max)
+        plate_cy = 0.5 * (plate_y_min + plate_y_max)
+        dx = center[0] - plate_cx
+        dy = center[1] - plate_cy
+        if abs(dx) >= abs(dy):
+            marker_center[0] = center[0] + marker_offset * np.sign(dx if dx != 0 else 1.0)
+        else:
+            marker_center[1] = center[1] + marker_offset * np.sign(dy if dy != 0 else 1.0)
+
+    plotter.subplot(0, 0)
+    marker_sphere = pv.Sphere(radius=0.008, center=marker_center)
+    marker_actor = plotter.add_mesh(marker_sphere, name=f"picked_cell_{cell_idx}", color='cyan')
     picked_marker_actors.append(marker_actor)
 
     print(f"Added temperature history: {label}")
@@ -1123,7 +1169,7 @@ skip       = max(1, steps // 1800)
 frame_list = list(range(0, steps, skip))
 frame_dt   = skip * dt_sim
 
-FRAME_TIME = 0.022
+FRAME_TIME = 0.055   # [s] increased from 0.022 for more visible spray on/off pulsing
 
 # ------------------------------------------------------------------
 # Precompute smooth visual target path.
@@ -1173,9 +1219,32 @@ q_anim_path = smooth_joint_path(chain, q_anim_path, passes=4)
 print(f"Animation frames: {len(frame_list)}")
 print("Done precomputing normal-aligned animation path.")
 
+# Physics-robot coupling diagnostic: how well does IK track the commanded path?
+# If tracking is tight, waypoint-based PULSE spray masks are physically valid.
+# If tracking has significant error, real coupling would require recomputing
+# PULSE with tool0-world positions and re-running the physics scan.
+_tool0_positions = []
+for q in q_anim_path:
+    _tool0_positions.append(get_tool0_world(UR5E_JOINT_NAMES, chain, robot_base_T, urdf, q))
+_tool0_positions = np.array(_tool0_positions)
+_ik_errors = np.linalg.norm(_tool0_positions - visual_targets, axis=1)
+print("")
+print("Physics-robot coupling report:")
+print(f"  IK tracking error: mean={_ik_errors.mean()*1000:.3f} mm, "
+      f"max={_ik_errors.max()*1000:.3f} mm")
+if _ik_errors.max() < 0.001:
+    print(f"  --> waypoint-based PULSE spray masks are numerically valid ")
+    print(f"      (IK error << spray footprint scale)")
+else:
+    print(f"  --> IK tracking exceeds 1 mm; consider re-running physics with ")
+    print(f"      tool0-based PULSE for tighter physics-robot coupling")
+print("")
+
 # Turn spray on only after trajectory planning is complete.
+# Actual visibility is now controlled per-frame by the physics valve state.
 spray_actor.SetVisibility(True)
 spray_head_actor.SetVisibility(True)
+SPRAY_VISIBLE_THRESHOLD = 0.05   # [-] fade in once physics says >5% valve intensity
 
 # set first pose before display loop starts
 q_first = q_anim_path[0]
@@ -1219,6 +1288,10 @@ while True:
             alignment = np.dot(get_nozzle_direction_world(UR5E_JOINT_NAMES, chain, robot_base_T, urdf, q), -surf_normal)
             print(f"Start-of-pass tool0 tracking error: {err_world:.3f} m")
             print(f"Start-of-pass spray-normal alignment: {alignment:.3f}")
+
+        # Pure snake pattern: spray always on at full intensity
+        spray_actor.SetVisibility(True)
+        spray_actor.GetProperty().SetOpacity(0.95)
 
         new_spray = make_pressure_jet(jet_origin, impact_center, sim_time)
         spray_poly.points = new_spray.points
